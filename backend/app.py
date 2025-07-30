@@ -1,4 +1,4 @@
-# app.py (ou stock_analysis_backend.py)
+# app.py - Backend Flask com Celery para processamento assíncrono
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yfinance as yf
@@ -14,10 +14,13 @@ import sys
 import json
 import traceback
 
+# Importações Celery
+from celery import Celery
+from celery.result import AsyncResult
+
 # Importações específicas para LSTM
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-# Importar apenas se TensorFlow estiver instalado e for necessário
 try:
     from tensorflow.keras.models import Sequential, load_model
     from tensorflow.keras.layers import LSTM, Dense, Dropout
@@ -27,7 +30,6 @@ try:
 except ImportError:
     print("TensorFlow/Keras não encontrado. Funções LSTM serão desativadas.")
     LSTM_AVAILABLE = False
-
 
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands
@@ -52,11 +54,31 @@ warnings.filterwarnings("ignore")
 app = Flask(__name__)
 CORS(app) # Habilita CORS para permitir requisições do frontend React
 
-# --- NOVA ROTA PARA ACESSO DIRETO VIA NAVEGADOR ---
+# --- Configuração do Celery ---
+# A URL do Redis será obtida de uma variável de ambiente no Render
+redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+
+celery_app = Celery(
+    'stock_analyzer',
+    broker=redis_url,
+    backend=redis_url # O backend é usado para armazenar os resultados das tarefas
+)
+celery_app.conf.update(
+    task_serializer='json',
+    result_serializer='json',
+    accept_content=['json'],
+    timezone='America/Sao_Paulo', # Ajuste para seu fuso horário
+    enable_utc=True,
+    broker_connection_retry_on_startup=True # Ajuda na reconexão em caso de reinício do broker
+)
+# --- Fim da Configuração do Celery ---
+
+
+# --- Rota de Boas-Vindas ---
 @app.route('/', methods=['GET'])
 def home():
     return "Bem-vindo ao serviço de Análise de Ações! Use o endpoint /analyze_stock com um método POST para análises."
-# --- FIM DA NOVA ROTA ---
+# --- Fim da Rota de Boas-Vindas ---
 
 # Configure logging to go to a file and stderr, not stdout
 logging.basicConfig(
@@ -70,7 +92,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# --- CLASSE DE CONFIGURAÇÃO INTEGRADA ---
 @dataclass
 class Config:
     TICKER: str = "b3sa3.SA"
@@ -102,7 +123,8 @@ class Config:
     INITIAL_CAPITAL_BACKTEST: int = 10000
     CAPITAL_DEPLOYED_PER_TRADE: float = 0.2
 
-app_config = Config() # Global config instance
+# app_config será passado para a tarefa Celery
+app_config_instance = Config()
 
 
 @dataclass
@@ -580,7 +602,7 @@ class StockPredictor:
                     logger.info("Opção 'retrain' ativada. Retreinando o modelo.")
                 elif not model_exists:
                     logger.info("Modelo não encontrado ou scaler ausente. Treinando novo modelo.")
-                elif force_retrain_due_to_mismatch:
+                elif force_retrain_due_mismatch:
                     logger.info("Forçando retreinamento devido a incompatibilidade de features do modelo.")
 
                 self.model.build_model()
@@ -839,6 +861,70 @@ def find_integration_order(series):
         if d >= 2:
             return d
 
+# --- Tarefa Celery para a lógica de análise principal ---
+@celery_app.task(bind=True)
+def run_stock_analysis_task(self, ticker_input: str, period_input: str):
+    app_config = app_config_instance # Usar a instância global da configuração
+
+    app_config.TICKER = ticker_input
+    app_config.PERIOD = period_input
+
+    today = datetime.now()
+    if period_input.endswith('y'):
+        years = int(period_input[:-1])
+        start_date_offset = years * 365
+    elif period_input.endswith('mo'):
+        months = int(period_input[:-2])
+        start_date_offset = months * 30
+    else:
+        start_date_offset = app_config.START_DATE_OFFSET_YEARS * 365
+
+    app_config.START_DATE_OFFSET_YEARS = start_date_offset / 365
+
+    data_manager = DataManager(app_config)
+    end_date = today.strftime('%Y-%m-%d')
+    start_date = (today - timedelta(days=start_date_offset)).strftime('%Y-%m-%d')
+
+    full_results = {}
+
+    try:
+        # Atualizar o estado da tarefa
+        self.update_state(state='PROGRESS', meta={'status': 'Baixando dados da ação...', 'progress': 10})
+        raw_df = data_manager.download_stock_data(app_config.TICKER, start_date, end_date, use_cache=True)
+        
+        if raw_df.empty:
+            raise ValueError(f"Não foi possível baixar dados para {app_config.TICKER} no período {app_config.PERIOD}. DataFrame vazio.")
+
+        self.update_state(state='PROGRESS', meta={'status': 'Calculando indicadores técnicos...', 'progress': 30})
+        processed_df = data_manager.calculate_technical_indicators(raw_df.copy())
+        
+        if processed_df.empty:
+            raise ValueError(f"DataFrame vazio após o cálculo de indicadores para {app_config.TICKER}.")
+
+        processed_df['Date'] = processed_df.index
+        processed_df.reset_index(drop=True, inplace=True)
+
+        all_indicator_columns_for_validation = [col for col in processed_df.columns if col not in ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+        data_manager.validate_data(processed_df, all_indicator_columns_for_validation)
+        data_manager.validate_data(processed_df, app_config.FEATURES_LSTM)
+
+        self.update_state(state='PROGRESS', meta={'status': 'Executando previsão LSTM...', 'progress': 60})
+        lstm_output = run_lstm_prediction(processed_df.copy(), app_config)
+        
+        self.update_state(state='PROGRESS', meta={'status': 'Executando análise Bias-Variância...', 'progress': 90})
+        bias_variance_output = run_bias_variance_analysis(processed_df.copy(), app_config)
+
+        full_results['lstm_results'] = lstm_output
+        full_results['bias_variance_results'] = bias_variance_output
+
+        return full_results # Celery serializa isso automaticamente
+
+    except Exception as e:
+        error_message = f"Erro ao preparar os dados ou executar a análise: {str(e)}\n{traceback.format_exc()}"
+        logger.error(error_message, exc_info=True)
+        # Celery armazena informações de falha automaticamente
+        raise self.retry(exc=e, countdown=5, max_retries=3) # Tentar novamente em caso de falha temporária
+
 def run_bias_variance_analysis(df: pd.DataFrame, config: Config):
     results_bv = {}
 
@@ -1051,7 +1137,6 @@ def run_bias_variance_analysis(df: pd.DataFrame, config: Config):
 
     return results_bv
 
-
 def run_lstm_prediction(df: pd.DataFrame, config: Config):
     results_lstm = {}
     predictor = StockPredictor(config)
@@ -1071,73 +1156,65 @@ def run_lstm_prediction(df: pd.DataFrame, config: Config):
     return results_lstm
 
 
+# --- Endpoint para despachar a tarefa de análise ---
 @app.route('/analyze_stock', methods=['POST'])
-def analyze_stock():
+def analyze_stock_dispatch():
     data = request.get_json()
-    ticker_input = data.get('ticker', 'b3sa3.SA')
-    period_input = data.get('period', '1y')
+    ticker = data.get('ticker')
+    period = data.get('period')
 
-    app_config.TICKER = ticker_input
-    app_config.PERIOD = period_input
-
-    today = datetime.now()
-    if period_input.endswith('y'):
-        years = int(period_input[:-1])
-        start_date_offset = years * 365
-    elif period_input.endswith('mo'):
-        months = int(period_input[:-2])
-        start_date_offset = months * 30
-    else:
-        start_date_offset = app_config.START_DATE_OFFSET_YEARS * 365
-
-    app_config.START_DATE_OFFSET_YEARS = start_date_offset / 365
-
-    data_manager = DataManager(app_config)
-    end_date = today.strftime('%Y-%m-%d')
-    start_date = (today - timedelta(days=start_date_offset)).strftime('%Y-%m-%d')
-
-    full_results = {}
+    if not ticker or not period:
+        return jsonify({"error": "Ticker e período são obrigatórios."}), 400
 
     try:
-        raw_df = data_manager.download_stock_data(app_config.TICKER, start_date, end_date, use_cache=True)
-        
-        if raw_df.empty:
-            raise ValueError(f"Não foi possível baixar dados para {app_config.TICKER} no período {app_config.PERIOD}. DataFrame vazio.")
-
-        processed_df = data_manager.calculate_technical_indicators(raw_df.copy())
-        
-        if processed_df.empty:
-            raise ValueError(f"DataFrame vazio após o cálculo de indicadores para {app_config.TICKER}.")
-
-        processed_df['Date'] = processed_df.index
-        processed_df.reset_index(drop=True, inplace=True)
-
-        all_indicator_columns_for_validation = [col for col in processed_df.columns if col not in ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-        data_manager.validate_data(processed_df, all_indicator_columns_for_validation)
-        data_manager.validate_data(processed_df, app_config.FEATURES_LSTM)
-
-        # Execute both analyses
-        lstm_output = run_lstm_prediction(processed_df.copy(), app_config)
-        bias_variance_output = run_bias_variance_analysis(processed_df.copy(), app_config)
-
-        full_results['lstm_results'] = lstm_output
-        full_results['bias_variance_results'] = bias_variance_output
-
-        return jsonify(full_results)
-
+        # Despacha a tarefa para o Celery
+        task = run_stock_analysis_task.delay(ticker, period)
+        return jsonify({"message": "Análise iniciada em segundo plano.", "task_id": task.id}), 202 # 202 Accepted
     except Exception as e:
-        error_message = f"Erro ao preparar os dados ou executar a análise: {str(e)}\n{traceback.format_exc()}"
+        error_message = f"Erro ao despachar a tarefa de análise: {str(e)}\n{traceback.format_exc()}"
         logger.error(error_message, exc_info=True)
         return jsonify({"error": error_message}), 500
 
+# --- Novo Endpoint para verificar o status da tarefa ---
+@app.route('/task_status/<task_id>', methods=['GET'])
+def get_task_status(task_id):
+    task = celery_app.AsyncResult(task_id)
+
+    if task.state == 'PENDING':
+        response = {
+            'state': task.state,
+            'status': 'Tarefa ainda não iniciada ou na fila.'
+        }
+    elif task.state == 'PROGRESS':
+        response = {
+            'state': task.state,
+            'status': task.info.get('status', 'Processando...'),
+            'progress': task.info.get('progress', 0)
+        }
+    elif task.state == 'SUCCESS':
+        response = {
+            'state': task.state,
+            'status': 'Tarefa concluída com sucesso.',
+            'result': task.result # Os resultados da análise
+        }
+    elif task.state == 'FAILURE':
+        response = {
+            'state': task.state,
+            'status': 'Tarefa falhou.',
+            'error': str(task.info) # Informações do erro
+        }
+    else:
+        response = {
+            'state': task.state,
+            'status': 'Status desconhecido.'
+        }
+    return jsonify(response)
+
+
 if __name__ == '__main__':
-    # Para execução local, use: python app.py
-    # Para implantação em nuvem, o provedor de serviços pode gerenciar a execução.
-    # Exemplo para Flask local:
-    # app.run(debug=True, host='0.0.0.0', port=5000)
-    # Use um servidor de produção como Gunicorn para produção: gunicorn -w 4 app:app
-    print("Iniciando Flask app. Para testar localmente, acesse http://127.0.0.1:5000/analyze_stock com um POST request.")
+    print("Iniciando Flask app. Para testar localmente, acesse http://127.0.0.1:5000/ com um GET request ou http://127.0.0.1:5000/analyze_stock com um POST request.")
     print("Certifique-se de ter as dependências instaladas: pip install -r requirements.txt")
     print("Exemplo de POST request (usando curl):")
     print("curl -X POST -H \"Content-Type: application/json\" -d '{\"ticker\": \"b3sa3.SA\", \"period\": \"1y\"}' http://127.0.0.1:5000/analyze_stock")
     app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
+
