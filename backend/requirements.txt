@@ -6,6 +6,8 @@ numpy
 scikit-learn
 statsmodels
 mlxtend
-tensorflow # Opcional, se você for usar o modelo LSTM
+tensorflow==2.10.0 # Mantenha se for usar LSTM, caso contrário, remova.
 ta
-gunicorn # Para produção
+gunicorn
+celery
+redis
