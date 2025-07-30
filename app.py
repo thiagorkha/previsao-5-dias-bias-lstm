@@ -70,6 +70,41 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# --- CLASSE DE CONFIGURAÇÃO INTEGRADA ---
+@dataclass
+class Config:
+    TICKER: str = "b3sa3.SA"
+    PERIOD: str = "1y"
+    DIAS_PREVISAO: int = 5
+    LOOKBACK: int = 60
+    EPOCHS: int = 100
+    BATCH_SIZE: int = 32
+    START_DATE_OFFSET_YEARS: int = 5
+    FEATURES_LSTM: List[str] = field(default_factory=lambda: [
+        "Close", "SMA_20", "RSI", "MACD", "BollingerBands_Upper", "BollingerBands_Lower"
+    ])
+    MODEL_PATH: str = "lstm_model.h5"
+    DATA_PATH: str = "dados_acao.csv"
+    PLOT_PATH: str = "previsao_acao.png"
+    TRAIN_SPLIT_RATIO: float = 0.8
+    PLOT_LAST_DAYS: int = 100
+    CACHE_DIR: str = "cache"
+    LOG_FILE: str = "stock_predictor.log"
+    EARLY_STOPPING_PATIENCE: int = 15
+    LSTM_UNITS: List[int] = field(default_factory=lambda: [100, 50])
+    DENSE_UNITS: List[int] = field(default_factory=lambda: [50])
+    DROPOUT_RATE: float = 0.3
+
+    WINDOW_SIZE_BIAS_VARIANCE: int = 250
+    STEP_SIZE_BIAS_VARIANCE: int = 1
+    N_COMPONENTS_PCA: int = 4
+    NUM_ROUNDS_BIAS_VARIANCE: int = 100
+    INITIAL_CAPITAL_BACKTEST: int = 10000
+    CAPITAL_DEPLOYED_PER_TRADE: float = 0.2
+
+app_config = Config() # Global config instance
+
+
 @dataclass
 class ModelMetrics:
     rmse: float
@@ -545,7 +580,7 @@ class StockPredictor:
                     logger.info("Opção 'retrain' ativada. Retreinando o modelo.")
                 elif not model_exists:
                     logger.info("Modelo não encontrado ou scaler ausente. Treinando novo modelo.")
-                elif force_retrain_due_mismatch:
+                elif force_retrain_due_to_mismatch:
                     logger.info("Forçando retreinamento devido a incompatibilidade de features do modelo.")
 
                 self.model.build_model()
@@ -953,7 +988,7 @@ def run_bias_variance_analysis(df: pd.DataFrame, config: Config):
         else:
             temp_df_for_latest_indicators = df.copy()
 
-        latest_indicators_full_df = DataManager(app_config).calculate_technical_indicators(temp_df_for_latest_indicators)
+        latest_indicators_full_df = DataManager(config).calculate_technical_indicators(temp_df_for_latest_indicators)
 
         if not latest_indicators_full_df.empty:
             latest_full_indicators_row = latest_indicators_full_df.iloc[-1]
@@ -1096,7 +1131,12 @@ def analyze_stock():
         return jsonify({"error": error_message}), 500
 
 if __name__ == '__main__':
-    print("Iniciando Flask app. Para testar localmente, acesse http://127.0.0.1:5000/ com um GET request ou http://127.0.0.1:5000/analyze_stock com um POST request.")
+    # Para execução local, use: python app.py
+    # Para implantação em nuvem, o provedor de serviços pode gerenciar a execução.
+    # Exemplo para Flask local:
+    # app.run(debug=True, host='0.0.0.0', port=5000)
+    # Use um servidor de produção como Gunicorn para produção: gunicorn -w 4 app:app
+    print("Iniciando Flask app. Para testar localmente, acesse http://127.0.0.1:5000/analyze_stock com um POST request.")
     print("Certifique-se de ter as dependências instaladas: pip install -r requirements.txt")
     print("Exemplo de POST request (usando curl):")
     print("curl -X POST -H \"Content-Type: application/json\" -d '{\"ticker\": \"b3sa3.SA\", \"period\": \"1y\"}' http://127.0.0.1:5000/analyze_stock")
