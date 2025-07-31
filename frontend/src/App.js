@@ -3,6 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 const App = () => {
     const [ticker, setTicker] = useState('b3sa3.SA');
     const [period, setPeriod] = useState('1y'); 
+    const [modelChoice, setModelChoice] = useState('all'); // Novo estado para a escolha do modelo
     const [loading, setLoading] = useState(false);
     const [lstmResults, setLstmResults] = useState(null);
     const [biasVarianceResults, setBiasVarianceResults] = useState(null);
@@ -13,7 +14,7 @@ const App = () => {
 
     // IMPORTANTE: Substitua este URL pelo URL do seu backend Python implantado no Render!
     // Exemplo: 'https://seu-nome-do-backend.onrender.com' (sem o /analyze_stock)
-    const backendBaseUrl = 'https://previsao-5-dias-bias-lstm.onrender.com'; 
+    const backendBaseUrl = 'https://SEU_URL_BASE_DO_BACKEND_AQUI'; 
     const dispatchEndpoint = `${backendBaseUrl}/analyze_stock`;
     const statusEndpoint = (id) => `${backendBaseUrl}/task_status/${id}`;
 
@@ -42,7 +43,11 @@ const App = () => {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ ticker: ticker, period: period })
+                body: JSON.stringify({ 
+                    ticker: ticker, 
+                    period: period,
+                    model_choice: modelChoice // Envia a escolha do modelo
+                })
             });
 
             if (!response.ok) {
@@ -125,7 +130,7 @@ const App = () => {
             <div className="bg-white p-6 rounded-lg shadow-md w-full max-w-4xl mb-6">
                 <h1 className="text-3xl font-bold text-center text-gray-800 mb-6">Análise Unificada de Ações</h1>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6"> {/* Ajuste para 3 colunas */}
                     <div>
                         <label htmlFor="ticker" className="block text-sm font-medium text-gray-700 mb-1">
                             Ticker da Ação (ex: b3sa3.SA, ^BVSP)
@@ -152,6 +157,21 @@ const App = () => {
                             placeholder="Ex: 5y"
                         />
                     </div>
+                    <div> {/* Nova seção para escolha do modelo */}
+                        <label htmlFor="modelChoice" className="block text-sm font-medium text-gray-700 mb-1">
+                            Escolha do Modelo
+                        </label>
+                        <select
+                            id="modelChoice"
+                            className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                            value={modelChoice}
+                            onChange={(e) => setModelChoice(e.target.value)}
+                        >
+                            <option value="all">Ambos (LSTM e Bias-Variância)</option>
+                            <option value="lstm">Apenas Previsão LSTM</option>
+                            <option value="bias_variance">Apenas Análise Bias-Variância</option>
+                        </select>
+                    </div>
                 </div>
 
                 <button
@@ -159,7 +179,7 @@ const App = () => {
                     disabled={loading}
                     className="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
-                    {loading ? 'Iniciando Análise...' : 'Executar Análise Completa'}
+                    {loading ? 'Iniciando Análise...' : 'Executar Análise'}
                 </button>
             </div>
 
@@ -183,14 +203,17 @@ const App = () => {
                 </div>
             )}
 
-            {lstmResults && biasVarianceResults && (
+            {/* Condicionalmente renderiza os resultados com base na escolha do modelo ou se ambos foram executados */}
+            {(lstmResults || biasVarianceResults) && (
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 w-full max-w-6xl">
                     {/* Seção de Previsão LSTM */}
                     <div className="bg-white p-6 rounded-lg shadow-md">
                         <h2 className="text-2xl font-semibold text-gray-800 mb-4 border-b pb-2">Resultados da Previsão LSTM</h2>
-                        {lstmResults.error ? (
+                        {lstmResults && lstmResults.error ? (
                             <p className="text-red-600">{lstmResults.error}</p>
-                        ) : (
+                        ) : lstmResults && lstmResults.message ? (
+                            <p className="text-gray-600">{lstmResults.message}</p>
+                        ) : lstmResults ? (
                             <>
                                 <p className="mb-2"><strong className="text-gray-700">Ticker:</strong> {lstmResults.ticker}</p>
                                 <p className="mb-2"><strong className="text-gray-700">Preço Atual (último do histórico):</strong> {formatCurrency(lstmResults.current_price)}</p>
@@ -218,15 +241,19 @@ const App = () => {
                                     {/* Gráficos de previsão e indicadores (RSI, MACD) seriam exibidos aqui em uma implementação completa. */}
                                 </p>
                             </>
+                        ) : (
+                            <p className="text-gray-500">Nenhum resultado de LSTM disponível.</p>
                         )}
                     </div>
 
                     {/* Seção de Análise de Bias-Variância */}
                     <div className="bg-white p-6 rounded-lg shadow-md">
                         <h2 className="text-2xl font-semibold text-gray-800 mb-4 border-b pb-2">Resultados da Análise de Bias-Variância</h2>
-                        {biasVarianceResults.error ? (
+                        {biasVarianceResults && biasVarianceResults.error ? (
                             <p className="text-red-600">{biasVarianceResults.error}</p>
-                        ) : (
+                        ) : biasVarianceResults && biasVarianceResults.message ? (
+                            <p className="text-gray-600">{biasVarianceResults.message}</p>
+                        ) : biasVarianceResults ? (
                             <>
                                 <h3 className="text-xl font-medium text-gray-700 mt-4 mb-2">Decomposição Bias-Variância:</h3>
                                 {biasVarianceResults.bias_variance_decomposition && typeof biasVarianceResults.bias_variance_decomposition === 'object' ? (
@@ -300,6 +327,8 @@ const App = () => {
                                     {/* Gráficos de previsão e indicadores (RSI, MACD) seriam exibidos aqui em uma implementação completa. */}
                                 </p>
                             </>
+                        ) : (
+                            <p className="text-gray-500">Nenhum resultado de Bias-Variância disponível.</p>
                         )}
                     </div>
                 </div>
