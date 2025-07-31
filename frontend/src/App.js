@@ -14,7 +14,7 @@ const App = () => {
 
     // IMPORTANTE: Substitua este URL pelo URL do seu backend Python implantado no Render!
     // Exemplo: 'https://seu-nome-do-backend.onrender.com' (sem o /analyze_stock)
-    const backendBaseUrl = 'https://85e7a5ca2d17.ngrok-free.app'; 
+    const backendBaseUrl = "https://778c5b6837b1.ngrok-free.app"; 
     const dispatchEndpoint = `${backendBaseUrl}/analyze_stock`;
     const statusEndpoint = (id) => `${backendBaseUrl}/task_status/${id}`;
 
