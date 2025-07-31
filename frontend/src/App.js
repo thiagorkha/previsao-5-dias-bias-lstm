@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 const App = () => {
     const [ticker, setTicker] = useState('b3sa3.SA');
     const [period, setPeriod] = useState('1y'); 
-    const [modelChoice, setModelChoice] = useState('all'); // Novo estado para a escolha do modelo
+    const [modelChoice, setModelChoice] = useState('all');
     const [loading, setLoading] = useState(false);
     const [lstmResults, setLstmResults] = useState(null);
     const [biasVarianceResults, setBiasVarianceResults] = useState(null);
@@ -12,16 +12,20 @@ const App = () => {
     const [taskStatus, setTaskStatus] = useState("Aguardando início da análise...");
     const [taskProgress, setTaskProgress] = useState(0);
 
-    // IMPORTANTE: Substitua este URL pela URL pública que o ngrok te der!
-    const backendBaseUrl = "https://778c5b6837b1.ngrok-free.app"; 
-    const dispatchEndpoint = `${backendBaseUrl}/analyze_stock`;
-    const statusEndpoint = (id) => `${backendBaseUrl}/task_status/${id}`;
+    // Novo estado para a URL do ngrok.
+    const [ngrokUrl, setNgrokUrl] = useState('');
 
-    // Ref para o intervalo de polling para que possamos limpá-lo
+    const dispatchEndpoint = `${ngrokUrl}/analyze_stock`;
+    const statusEndpoint = (id) => `${ngrokUrl}/task_status/${id}`;
+
     const pollingIntervalRef = useRef(null);
 
-    // Função para iniciar a análise (despachar a tarefa)
     const startAnalysis = async () => {
+        if (!ngrokUrl) {
+            setError("Por favor, insira a URL pública do ngrok.");
+            return;
+        }
+
         setLoading(true);
         setError(null);
         setLstmResults(null);
@@ -30,7 +34,6 @@ const App = () => {
         setTaskStatus("Iniciando análise...");
         setTaskProgress(0);
 
-        // Limpa qualquer intervalo de polling anterior
         if (pollingIntervalRef.current) {
             clearInterval(pollingIntervalRef.current);
             pollingIntervalRef.current = null;
@@ -45,29 +48,27 @@ const App = () => {
                 body: JSON.stringify({ 
                     ticker: ticker, 
                     period: period,
-                    model_choice: modelChoice // Envia a escolha do modelo
+                    model_choice: modelChoice
                 })
             });
 
             if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(errorData.error || `Erro HTTP: ${response.status}`);
+                const errorText = await response.text();
+                throw new Error(`Erro HTTP: ${response.status}. Resposta do servidor: ${errorText.slice(0, 100)}...`);
             }
 
             const data = await response.json();
             setTaskId(data.task_id);
             setTaskStatus(data.message || "Tarefa despachada com sucesso.");
 
-            // Inicia o polling para verificar o status da tarefa
-            pollingIntervalRef.current = setInterval(() => checkTaskStatus(data.task_id), 5000); // Consulta a cada 5 segundos
+            pollingIntervalRef.current = setInterval(() => checkTaskStatus(data.task_id), 5000);
 
         } catch (fetchError) {
             setError(`Erro ao iniciar a análise: ${fetchError.message}.`);
-            setLoading(false); // Parar o carregamento se a tarefa não puder ser despachada
+            setLoading(false);
         }
     };
 
-    // Função para verificar o status da tarefa
     const checkTaskStatus = async (id) => {
         if (!id) return;
 
@@ -82,26 +83,25 @@ const App = () => {
             setTaskProgress(data.progress || 0);
 
             if (data.state === 'SUCCESS') {
-                clearInterval(pollingIntervalRef.current); // Para o polling
+                clearInterval(pollingIntervalRef.current);
                 pollingIntervalRef.current = null;
                 setLstmResults(data.result.lstm_results);
                 setBiasVarianceResults(data.result.bias_variance_results);
-                setLoading(false); // Análise concluída
+                setLoading(false);
             } else if (data.state === 'FAILURE') {
-                clearInterval(pollingIntervalRef.current); // Para o polling
+                clearInterval(pollingIntervalRef.current);
                 pollingIntervalRef.current = null;
                 setError(`Análise falhou: ${data.error || 'Erro desconhecido.'}`);
-                setLoading(false); // Análise falhou
+                setLoading(false);
             }
         } catch (statusError) {
-            clearInterval(pollingIntervalRef.current); // Para o polling em caso de erro de comunicação
+            clearInterval(pollingIntervalRef.current);
             pollingIntervalRef.current = null;
             setError(`Erro ao verificar status da tarefa: ${statusError.message}`);
             setLoading(false);
         }
     };
 
-    // Limpa o intervalo quando o componente é desmontado
     useEffect(() => {
         return () => {
             if (pollingIntervalRef.current) {
@@ -128,8 +128,22 @@ const App = () => {
         <div className="min-h-screen bg-gray-100 p-4 font-sans flex flex-col items-center">
             <div className="bg-white p-6 rounded-lg shadow-md w-full max-w-4xl mb-6">
                 <h1 className="text-3xl font-bold text-center text-gray-800 mb-6">Análise Unificada de Ações</h1>
+                
+                <div className="mb-4">
+                    <label htmlFor="ngrokUrl" className="block text-sm font-medium text-gray-700 mb-1">
+                        URL Pública do Ngrok (Cole aqui)
+                    </label>
+                    <input
+                        type="text"
+                        id="ngrokUrl"
+                        className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
+                        value={ngrokUrl}
+                        onChange={(e) => setNgrokUrl(e.target.value)}
+                        placeholder="Ex: https://abcdef123.ngrok-free.app"
+                    />
+                </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6"> {/* Ajuste para 3 colunas */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
                     <div>
                         <label htmlFor="ticker" className="block text-sm font-medium text-gray-700 mb-1">
                             Ticker da Ação (ex: b3sa3.SA, ^BVSP)
@@ -156,7 +170,7 @@ const App = () => {
                             placeholder="Ex: 5y"
                         />
                     </div>
-                    <div> {/* Nova seção para escolha do modelo */}
+                    <div>
                         <label htmlFor="modelChoice" className="block text-sm font-medium text-gray-700 mb-1">
                             Escolha do Modelo
                         </label>
@@ -175,7 +189,7 @@ const App = () => {
 
                 <button
                     onClick={startAnalysis}
-                    disabled={loading}
+                    disabled={loading || !ngrokUrl}
                     className="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
                     {loading ? 'Iniciando Análise...' : 'Executar Análise'}
@@ -202,10 +216,8 @@ const App = () => {
                 </div>
             )}
 
-            {/* Condicionalmente renderiza os resultados com base na escolha do modelo ou se ambos foram executados */}
             {(lstmResults || biasVarianceResults) && (
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 w-full max-w-6xl">
-                    {/* Seção de Previsão LSTM */}
                     <div className="bg-white p-6 rounded-lg shadow-md">
                         <h2 className="text-2xl font-semibold text-gray-800 mb-4 border-b pb-2">Resultados da Previsão LSTM</h2>
                         {lstmResults && lstmResults.error ? (
@@ -237,7 +249,6 @@ const App = () => {
                                     })}
                                 </div>
                                 <p className="text-sm text-gray-500 mt-4">
-                                    {/* Gráficos de previsão e indicadores (RSI, MACD) seriam exibidos aqui em uma implementação completa. */}
                                 </p>
                             </>
                         ) : (
@@ -245,7 +256,6 @@ const App = () => {
                         )}
                     </div>
 
-                    {/* Seção de Análise de Bias-Variância */}
                     <div className="bg-white p-6 rounded-lg shadow-md">
                         <h2 className="text-2xl font-semibold text-gray-800 mb-4 border-b pb-2">Resultados da Análise de Bias-Variância</h2>
                         {biasVarianceResults && biasVarianceResults.error ? (
@@ -323,7 +333,6 @@ const App = () => {
                                     <p className="text-gray-600">{biasVarianceResults.future_prediction}</p>
                                 )}
                                 <p className="text-sm text-gray-500 mt-4">
-                                    {/* Gráficos de previsão e indicadores (RSI, MACD) seriam exibidos aqui em uma implementação completa. */}
                                 </p>
                             </>
                         ) : (
