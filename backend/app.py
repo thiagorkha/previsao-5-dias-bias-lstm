@@ -1,4 +1,4 @@
-# app.py - Backend Flask com Celery para processamento assíncrono
+# app.py - Backend Flask com Celery para processamento assíncrono e escolha de modelo
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yfinance as yf
@@ -95,31 +95,31 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Config:
     TICKER: str = "b3sa3.SA"
-    PERIOD: str = "1y"
-    DIAS_PREVISAO: int = 5
-    LOOKBACK: int = 30
-    EPOCHS: int = 15
-    BATCH_SIZE: int = 16
-    START_DATE_OFFSET_YEARS: int = 2
+    PERIOD: str = "6mo" # Reduzido para 6 meses de dados
+    DIAS_PREVISAO: int = 5 # Reduzido
+    LOOKBACK: int = 60 # Reduzido
+    EPOCHS: int = 100 # Reduzido drasticamente
+    BATCH_SIZE: int = 32 # Reduzido
+    START_DATE_OFFSET_YEARS: int = 5 # Não ir muito para o passado
     FEATURES_LSTM: List[str] = field(default_factory=lambda: [
-        "Close", "SMA_20", "RSI", "MACD", "BollingerBands_Upper", "BollingerBands_Lower"
+        "Close", "SMA_20", "RSI", "MACD" # Menos features
     ])
     MODEL_PATH: str = "lstm_model.h5"
     DATA_PATH: str = "dados_acao.csv"
     PLOT_PATH: str = "previsao_acao.png"
-    TRAIN_SPLIT_RATIO: float = 0.8
-    PLOT_LAST_DAYS: int = 100
+    TRAIN_SPLIT_RATIO: float = 0.7 # Ajustado
+    PLOT_LAST_DAYS: int = 50 # Reduzido
     CACHE_DIR: str = "cache"
     LOG_FILE: str = "stock_predictor.log"
-    EARLY_STOPPING_PATIENCE: int = 15
-    LSTM_UNITS: List[int] = field(default_factory=lambda: [100, 50])
-    DENSE_UNITS: List[int] = field(default_factory=lambda: [50])
-    DROPOUT_RATE: float = 0.3
+    EARLY_STOPPING_PATIENCE: int = 5 # Reduzido
+    LSTM_UNITS: List[int] = field(default_factory=lambda: [30]) # Menos unidades
+    DENSE_UNITS: List[int] = field(default_factory=lambda: [10]) # Menos unidades
+    DROPOUT_RATE: float = 0.2 # Reduzido
 
-    WINDOW_SIZE_BIAS_VARIANCE: int = 250
+    WINDOW_SIZE_BIAS_VARIANCE: int = 50 # Reduzido drasticamente
     STEP_SIZE_BIAS_VARIANCE: int = 1
-    N_COMPONENTS_PCA: int = 4
-    NUM_ROUNDS_BIAS_VARIANCE: int = 100
+    N_COMPONENTS_PCA: int = 2 # Menos componentes PCA
+    NUM_ROUNDS_BIAS_VARIANCE: int = 10 # Reduzido drasticamente
     INITIAL_CAPITAL_BACKTEST: int = 10000
     CAPITAL_DEPLOYED_PER_TRADE: float = 0.2
 
@@ -366,855 +366,864 @@ class DataManager:
         return True
 
 
-class LSTMModel:
-    def __init__(self, input_shape: Tuple[int, int], config: Config):
-        self.config = config
-        self.input_shape = input_shape
-        self.model = None
-        self.scaler = MinMaxScaler()
-        self.is_trained = False
+    class LSTMModel:
+        def __init__(self, input_shape: Tuple[int, int], config: Config):
+            self.config = config
+            self.input_shape = input_shape
+            self.model = None
+            self.scaler = MinMaxScaler()
+            self.is_trained = False
 
-    def build_model(self) -> None:
-        if not LSTM_AVAILABLE:
-            raise RuntimeError("TensorFlow/Keras não está disponível. Não é possível construir o modelo LSTM.")
-        logger.info("Construindo modelo LSTM...")
+        def build_model(self) -> None:
+            if not LSTM_AVAILABLE:
+                raise RuntimeError("TensorFlow/Keras não está disponível. Não é possível construir o modelo LSTM.")
+            logger.info("Construindo modelo LSTM...")
 
-        self.model = Sequential()
+            self.model = Sequential()
 
-        self.model.add(LSTM(
-            self.config.LSTM_UNITS[0],
-            return_sequences=len(self.config.LSTM_UNITS) > 1,
-            input_shape=self.input_shape
-        ))
-        self.model.add(Dropout(self.config.DROPOUT_RATE))
-
-        for i, units in enumerate(self.config.LSTM_UNITS[1:], 1):
-            return_sequences = i < len(self.config.LSTM_UNITS) - 1
-            self.model.add(LSTM(units, return_sequences=return_sequences))
+            self.model.add(LSTM(
+                self.config.LSTM_UNITS[0],
+                return_sequences=len(self.config.LSTM_UNITS) > 1,
+                input_shape=self.input_shape
+            ))
             self.model.add(Dropout(self.config.DROPOUT_RATE))
 
-        for units in self.config.DENSE_UNITS:
-            self.model.add(Dense(units, activation='relu'))
-            self.model.add(Dropout(self.config.DROPOUT_RATE))
+            for i, units in enumerate(self.config.LSTM_UNITS[1:], 1):
+                return_sequences = i < len(self.config.LSTM_UNITS) - 1
+                self.model.add(LSTM(units, return_sequences=return_sequences))
+                self.model.add(Dropout(self.config.DROPOUT_RATE))
 
-        self.model.add(Dense(1))
+            for units in self.config.DENSE_UNITS:
+                self.model.add(Dense(units, activation='relu'))
+                self.model.add(Dropout(self.config.DROPOUT_RATE))
 
-        self.model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+            self.model.add(Dense(1))
 
-        logger.info(f"Modelo construído com {self.model.count_params()} parâmetros")
-        # self.model.summary(print_fn=logger.info) # Removed for web app output
+            self.model.compile(optimizer='adam', loss='mse', metrics=['mae'])
 
-    def prepare_data(self, df: pd.DataFrame, features: List[str],
-                     lookback: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        logger.info("Preparando dados para LSTM...")
+            logger.info(f"Modelo construído com {self.model.count_params()} parâmetros")
+            # self.model.summary(print_fn=logger.info) # Removed for web app output
 
-        data_for_scaling = df[features].values
-        scaled_data = self.scaler.fit_transform(data_for_scaling)
+        def prepare_data(self, df: pd.DataFrame, features: List[str],
+                         lookback: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+            logger.info("Preparando dados para LSTM...")
 
-        X, y = [], []
-        close_idx = features.index("Close")
-        for i in range(lookback, len(scaled_data)):
-            X.append(scaled_data[i-lookback:i])
-            y.append(scaled_data[i, close_idx])
+            data_for_scaling = df[features].values
+            scaled_data = self.scaler.fit_transform(data_for_scaling)
 
-        X, y = np.array(X), np.array(y)
+            X, y = [], []
+            close_idx = features.index("Close")
+            for i in range(lookback, len(scaled_data)):
+                X.append(scaled_data[i-lookback:i])
+                y.append(scaled_data[i, close_idx])
 
-        train_size = int(len(X) * self.config.TRAIN_SPLIT_RATIO)
-        X_train, X_test = X[:train_size], X[train_size:]
-        y_train, y_test = y[:train_size], y[train_size:]
+            X, y = np.array(X), np.array(y)
 
-        logger.info(f"Dados preparados - Treino: {X_train.shape}, Teste: {X_test.shape}")
+            train_size = int(len(X) * self.config.TRAIN_SPLIT_RATIO)
+            X_train, X_test = X[:train_size], X[train_size:]
+            y_train, y_test = y[:train_size], y[train_size:]
 
-        return X_train, X_test, y_train, y_test
+            logger.info(f"Dados preparados - Treino: {X_train.shape}, Teste: {X_test.shape}")
 
-    def train(self, X_train: np.ndarray, y_train: np.ndarray,
-              X_val: np.ndarray, y_val: np.ndarray) -> Dict[str, Any]:
-        if not LSTM_AVAILABLE:
-            raise RuntimeError("TensorFlow/Keras não está disponível. Não é possível treinar o modelo LSTM.")
-        if self.model is None:
-            raise ValueError("Modelo não foi construído. Chame build_model() primeiro.")
+            return X_train, X_test, y_train, y_test
 
-        logger.info("Iniciando treinamento do modelo...")
+        def train(self, X_train: np.ndarray, y_train: np.ndarray,
+                  X_val: np.ndarray, y_val: np.ndarray) -> Dict[str, Any]:
+            if not LSTM_AVAILABLE:
+                raise RuntimeError("TensorFlow/Keras não está disponível. Não é possível treinar o modelo LSTM.")
+            if self.model is None:
+                raise ValueError("Modelo não foi construído. Chame build_model() primeiro.")
 
-        callbacks = [
-            EarlyStopping(
-                monitor='val_loss',
-                patience=self.config.EARLY_STOPPING_PATIENCE,
-                restore_best_weights=True,
-                verbose=0 # Changed to 0 for web app
-            ),
-            ModelCheckpoint(
-                self.config.MODEL_PATH,
-                monitor='val_loss',
-                save_best_only=True,
-                verbose=0 # Changed to 0 for web app
-            )
-        ]
+            logger.info("Iniciando treinamento do modelo...")
 
-        history = self.model.fit(
-            X_train, y_train,
-            validation_data=(X_val, y_val),
-            epochs=self.config.EPOCHS,
-            batch_size=self.config.BATCH_SIZE,
-            callbacks=callbacks,
-            verbose=0 # Changed to 0 for web app
-        )
-
-        self.is_trained = True
-        logger.info("Treinamento concluído")
-
-        return history.history
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        if not LSTM_AVAILABLE:
-            raise RuntimeError("TensorFlow/Keras não está disponível. Não é possível fazer previsões com o modelo LSTM.")
-        if not self.is_trained:
-            raise ValueError("Modelo não foi treinado ou carregado.")
-
-        return self.model.predict(X, verbose=0)
-
-    def evaluate_model(self, X_test: np.ndarray, y_test: np.ndarray) -> ModelMetrics:
-        if not LSTM_AVAILABLE:
-            return ModelMetrics(rmse=np.nan, mae=np.nan, r2=np.nan)
-        y_pred = self.predict(X_test).flatten()
-
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        mae = mean_absolute_error(y_test, y_pred)
-        r2 = r2_score(y_test, y_pred)
-
-        return ModelMetrics(rmse=rmse, mae=mae, r2=r2)
-
-    def save_model(self, filepath: str) -> None:
-        if not LSTM_AVAILABLE:
-            logger.warning("TensorFlow/Keras não está disponível. Não é possível salvar o modelo LSTM.")
-            return
-        if self.model is None:
-            raise ValueError("Modelo não foi construído ou treinado.")
-
-        self.model.save(filepath)
-
-        scaler_path = filepath.replace('.h5', '_scaler.pkl')
-        with open(scaler_path, 'wb') as f:
-            pickle.dump(self.scaler, f)
-
-        logger.info(f"Modelo e scaler salvos em {filepath} e {scaler_path}")
-
-    def load_model(self, filepath: str) -> None:
-        if not LSTM_AVAILABLE:
-            raise RuntimeError("TensorFlow/Keras não está disponível. Não é possível carregar o modelo LSTM.")
-        try:
-            self.model = load_model(filepath, custom_objects={
-                'mse': tf.keras.losses.MeanSquaredError(),
-                'mae': tf.keras.metrics.MeanAbsoluteError()
-            })
-            scaler_path = filepath.replace('.h5', '_scaler.pkl')
-            with open(scaler_path, 'rb') as f:
-                self.scaler = pickle.load(f)
-
-            self.is_trained = True
-            logger.info(f"Modelo e scaler carregados de {filepath}")
-        except Exception as e:
-            logger.error(f"Erro ao carregar modelo ou scaler de {filepath}: {str(e)}")
-            raise
-
-
-class StockPredictor:
-    def __init__(self, config: Config):
-        self.config = config
-        self.data_manager = DataManager(self.config)
-        self.model: Optional[LSTMModel] = None
-        self.df: Optional[pd.DataFrame] = None
-
-    def predict_stock_price(self, ticker: str,
-                            dias_previsao: int = None,
-                            lookback: int = None,
-                            use_cache: bool = True,
-                            retrain: bool = False) -> Dict[str, Any]:
-        if not LSTM_AVAILABLE:
-            return {
-                'error': "TensorFlow/Keras não está disponível no ambiente do backend. Previsão LSTM desativada.",
-                'ticker': ticker,
-                'predictions': [],
-                'dates': [],
-                'metrics': {"rmse": None, "mae": None, "r2": None},
-                'current_price': None,
-                'data_shape': None
-            }
-
-        dias_previsao = dias_previsao if dias_previsao is not None else self.config.DIAS_PREVISAO
-        lookback = lookback if lookback is not None else self.config.LOOKBACK
-
-        try:
-            today = datetime.now()
-            end_date = today.strftime('%Y-%m-%d')
-            start_date = (today - timedelta(days=self.config.START_DATE_OFFSET_YEARS * 365)).strftime('%Y-%m-%d')
-
-            # Use self.df if already populated, otherwise download
-            if self.df is None:
-                self.df = self.data_manager.download_stock_data(
-                    ticker, start_date, end_date, use_cache
+            callbacks = [
+                EarlyStopping(
+                    monitor='val_loss',
+                    patience=self.config.EARLY_STOPPING_PATIENCE,
+                    restore_best_weights=True,
+                    verbose=0 # Changed to 0 for web app
+                ),
+                ModelCheckpoint(
+                    self.config.MODEL_PATH,
+                    monitor='val_loss',
+                    save_best_only=True,
+                    verbose=0 # Changed to 0 for web app
                 )
-                self.df = self.data_manager.calculate_technical_indicators(self.df)
-
-
-            self.data_manager.validate_data(self.df, self.config.FEATURES_LSTM)
-
-            logger.debug(f"DataFrame FINAL antes de preparar dados para o modelo. Shape: {self.df.shape}, Colunas: {self.df.columns.tolist()}")
-            if self.df.empty:
-                raise ValueError("DataFrame está vazio após o tratamento final de NaNs para as features.")
-
-            missing_features_final = [f for f in self.config.FEATURES_LSTM if f not in self.df.columns]
-            if missing_features_final:
-                logger.error(f"ERRO CRÍTICO: As seguintes features ainda estão faltando após validação: {missing_features_final}")
-                raise KeyError(f"Features obrigatórias não encontradas: {missing_features_final}")
-
-
-            self.model = LSTMModel(input_shape=(lookback, len(self.config.FEATURES_LSTM)), config=self.config)
-
-            X_train, X_test, y_train, y_test = self.model.prepare_data(
-                self.df, self.config.FEATURES_LSTM, lookback
-            )
-
-            model_exists = os.path.exists(self.config.MODEL_PATH) and os.path.exists(self.config.MODEL_PATH.replace('.h5', '_scaler.pkl'))
-
-            force_retrain_due_to_mismatch = False
-            if model_exists:
-                temp_model = None
-                try:
-                    temp_model = load_model(self.config.MODEL_PATH)
-                    loaded_input_features = temp_model.input_shape[2]
-                    current_expected_features = len(self.config.FEATURES_LSTM)
-
-                    if loaded_input_features != current_expected_features:
-                        logger.warning(f"O modelo carregado espera {loaded_input_features} features, mas a configuração atual tem {current_expected_features}. Forçando retreinamento.")
-                        force_retrain_due_to_mismatch = True
-                except Exception as e:
-                    logger.warning(f"Não foi possível inspecionar o modelo existente em {self.config.MODEL_PATH} ({e}). Forçando retreinamento para garantir compatibilidade.")
-                    force_retrain_due_to_mismatch = True
-                finally:
-                    if temp_model:
-                        del temp_model
-                        tf.keras.backend.clear_session()
-
-
-            if retrain or not model_exists or force_retrain_due_to_mismatch:
-                if retrain:
-                    logger.info("Opção 'retrain' ativada. Retreinando o modelo.")
-                elif not model_exists:
-                    logger.info("Modelo não encontrado ou scaler ausente. Treinando novo modelo.")
-                elif force_retrain_due_mismatch:
-                    logger.info("Forçando retreinamento devido a incompatibilidade de features do modelo.")
-
-                self.model.build_model()
-
-                val_split = int(len(X_train) * self.config.TRAIN_SPLIT_RATIO)
-                X_val = X_train[val_split:]
-                y_val = y_train[val_split:]
-                X_train_final = X_train[:val_split]
-                y_train_final = y_train[:val_split]
-
-                history = self.model.train(X_train_final, y_train_final, X_val, y_val)
-                self.model.save_model(self.config.MODEL_PATH)
-            else:
-                logger.info("Carregando modelo e scaler existentes.")
-                self.model.load_model(self.config.MODEL_PATH)
-
-            metrics = self.model.evaluate_model(X_test, y_test)
-            logger.info(f"Métricas do modelo: {metrics}")
-
-            predictions, actual_last_price = self._predict_future_prices(dias_previsao, lookback)
-
-            future_dates = [
-                (today + timedelta(days=i)).strftime('%Y-%m-%d')
-                for i in range(1, dias_previsao + 1)
             ]
 
-            results = {
-                'ticker': ticker,
-                'predictions': [float(p) for p in predictions], # Ensure serializable
-                'dates': future_dates,
-                'metrics': metrics.to_dict(), # Convert ModelMetrics to dict
-                'current_price': float(actual_last_price), # Ensure serializable
-                'data_shape': self.df.shape
-            }
+            history = self.model.fit(
+                X_train, y_train,
+                validation_data=(X_val, y_val),
+                epochs=self.config.EPOCHS,
+                batch_size=self.config.BATCH_SIZE,
+                callbacks=callbacks,
+                verbose=0 # Changed to 0 for web app
+            )
 
-            return results
+            self.is_trained = True
+            logger.info("Treinamento concluído")
 
-        except Exception as e:
-            logger.error(f"Erro fatal na previsão: {str(e)}", exc_info=True)
-            raise
+            return history.history
 
-    def _predict_future_prices(self, dias_previsao: int, lookback: int) -> Tuple[List[float], float]:
-        if not LSTM_AVAILABLE:
-            raise RuntimeError("TensorFlow/Keras não está disponível. Não é possível fazer previsões futuras com o modelo LSTM.")
-        if self.df is None or self.model is None or not self.model.is_trained:
-            raise ValueError("DataFrame ou modelo não estão prontos para previsão futura.")
+        def predict(self, X: np.ndarray) -> np.ndarray:
+            if not LSTM_AVAILABLE:
+                raise RuntimeError("TensorFlow/Keras não está disponível. Não é possível fazer previsões com o modelo LSTM.")
+            if not self.is_trained:
+                raise ValueError("Modelo não foi treinado ou carregado.")
 
-        if len(self.df) < lookback:
-            raise ValueError(f"Dados insuficientes para previsão futura. Necessário pelo menos {lookback} dias, mas tem {len(self.df)}.")
+            return self.model.predict(X, verbose=0)
 
-        missing_features_for_predict = [f for f in self.config.FEATURES_LSTM if f not in self.df.columns]
-        if missing_features_for_predict:
-            raise ValueError(f"Features faltando para previsão: {missing_features_for_predict}")
+        def evaluate_model(self, X_test: np.ndarray, y_test: np.ndarray) -> ModelMetrics:
+            if not LSTM_AVAILABLE:
+                return ModelMetrics(rmse=np.nan, mae=np.nan, r2=np.nan)
+            y_pred = self.predict(X_test).flatten()
 
-        last_data_point_scaled = self.model.scaler.transform(self.df[self.config.FEATURES_LSTM].tail(lookback).values)
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+            mae = mean_absolute_error(y_test, y_pred)
+            r2 = r2_score(y_test, y_pred)
 
-        actual_last_price = self.df['Close'].iloc[-1]
+            return ModelMetrics(rmse=rmse, mae=mae, r2=r2)
 
+        def save_model(self, filepath: str) -> None:
+            if not LSTM_AVAILABLE:
+                logger.warning("TensorFlow/Keras não está disponível. Não é possível salvar o modelo LSTM.")
+                return
+            if self.model is None:
+                raise ValueError("Modelo não foi construído ou treinado.")
+
+            self.model.save(filepath)
+
+            scaler_path = filepath.replace('.h5', '_scaler.pkl')
+            with open(scaler_path, 'wb') as f:
+                pickle.dump(self.scaler, f)
+
+            logger.info(f"Modelo e scaler salvos em {filepath} e {scaler_path}")
+
+        def load_model(self, filepath: str) -> None:
+            if not LSTM_AVAILABLE:
+                raise RuntimeError("TensorFlow/Keras não está disponível. Não é possível carregar o modelo LSTM.")
+            try:
+                self.model = load_model(filepath, custom_objects={
+                    'mse': tf.keras.losses.MeanSquaredError(),
+                    'mae': tf.keras.metrics.MeanAbsoluteError()
+                })
+                scaler_path = filepath.replace('.h5', '_scaler.pkl')
+                with open(scaler_path, 'rb') as f:
+                    self.scaler = pickle.load(f)
+
+                self.is_trained = True
+                logger.info(f"Modelo e scaler carregados de {filepath}")
+            except Exception as e:
+                logger.error(f"Erro ao carregar modelo ou scaler de {filepath}: {str(e)}")
+                raise
+
+
+    class StockPredictor:
+        def __init__(self, config: Config):
+            self.config = config
+            self.data_manager = DataManager(self.config)
+            self.model: Optional[LSTMModel] = None
+            self.df: Optional[pd.DataFrame] = None
+
+        def predict_stock_price(self, ticker: str,
+                                dias_previsao: int = None,
+                                lookback: int = None,
+                                use_cache: bool = True,
+                                retrain: bool = False) -> Dict[str, Any]:
+            if not LSTM_AVAILABLE:
+                return {
+                    'error': "TensorFlow/Keras não está disponível no ambiente do backend. Previsão LSTM desativada.",
+                    'ticker': ticker,
+                    'predictions': [],
+                    'dates': [],
+                    'metrics': {"rmse": None, "mae": None, "r2": None},
+                    'current_price': None,
+                    'data_shape': None
+                }
+
+            dias_previsao = dias_previsao if dias_previsao is not None else self.config.DIAS_PREVISAO
+            lookback = lookback if lookback is not None else self.config.LOOKBACK
+
+            try:
+                today = datetime.now()
+                end_date = today.strftime('%Y-%m-%d')
+                start_date = (today - timedelta(days=self.config.START_DATE_OFFSET_YEARS * 365)).strftime('%Y-%m-%d')
+
+                # Use self.df if already populated, otherwise download
+                if self.df is None:
+                    self.df = self.data_manager.download_stock_data(
+                        ticker, start_date, end_date, use_cache
+                    )
+                    self.df = self.data_manager.calculate_technical_indicators(self.df)
+
+
+                self.data_manager.validate_data(self.df, self.config.FEATURES_LSTM)
+
+                logger.debug(f"DataFrame FINAL antes de preparar dados para o modelo. Shape: {self.df.shape}, Colunas: {self.df.columns.tolist()}")
+                if self.df.empty:
+                    raise ValueError("DataFrame está vazio após o tratamento final de NaNs para as features.")
+
+                missing_features_final = [f for f in self.config.FEATURES_LSTM if f not in self.df.columns]
+                if missing_features_final:
+                    logger.error(f"ERRO CRÍTICO: As seguintes features ainda estão faltando após validação: {missing_features_final}")
+                    raise KeyError(f"Features obrigatórias não encontradas: {missing_features_final}")
+
+
+                self.model = LSTMModel(input_shape=(lookback, len(self.config.FEATURES_LSTM)), config=self.config)
+
+                X_train, X_test, y_train, y_test = self.model.prepare_data(
+                    self.df, self.config.FEATURES_LSTM, lookback
+                )
+
+                model_exists = os.path.exists(self.config.MODEL_PATH) and os.path.exists(self.config.MODEL_PATH.replace('.h5', '_scaler.pkl'))
+
+                force_retrain_due_to_mismatch = False
+                if model_exists:
+                    temp_model = None
+                    try:
+                        temp_model = load_model(self.config.MODEL_PATH)
+                        loaded_input_features = temp_model.input_shape[2]
+                        current_expected_features = len(self.config.FEATURES_LSTM)
+
+                        if loaded_input_features != current_expected_features:
+                            logger.warning(f"O modelo carregado espera {loaded_input_features} features, mas a configuração atual tem {current_expected_features}. Forçando retreinamento.")
+                            force_retrain_due_to_mismatch = True
+                    except Exception as e:
+                        logger.warning(f"Não foi possível inspecionar o modelo existente em {self.config.MODEL_PATH} ({e}). Forçando retreinamento para garantir compatibilidade.")
+                        force_retrain_due_to_mismatch = True
+                    finally:
+                        if temp_model:
+                            del temp_model
+                            tf.keras.backend.clear_session()
+
+
+                if retrain or not model_exists or force_retrain_due_to_mismatch:
+                    if retrain:
+                        logger.info("Opção 'retrain' ativada. Retreinando o modelo.")
+                    elif not model_exists:
+                        logger.info("Modelo não encontrado ou scaler ausente. Treinando novo modelo.")
+                    elif force_retrain_due_to_mismatch:
+                        logger.info("Forçando retreinamento devido a incompatibilidade de features do modelo.")
+
+                    self.model.build_model()
+
+                    val_split = int(len(X_train) * self.config.TRAIN_SPLIT_RATIO)
+                    X_val = X_train[val_split:]
+                    y_val = y_train[val_split:]
+                    X_train_final = X_train[:val_split]
+                    y_train_final = y_train[:val_split]
+
+                    history = self.model.train(X_train_final, y_train_final, X_val, y_val)
+                    self.model.save_model(self.config.MODEL_PATH)
+                else:
+                    logger.info("Carregando modelo e scaler existentes.")
+                    self.model.load_model(self.config.MODEL_PATH)
+
+                metrics = self.model.evaluate_model(X_test, y_test)
+                logger.info(f"Métricas do modelo: {metrics}")
+
+                predictions, actual_last_price = self._predict_future_prices(dias_previsao, lookback)
+
+                future_dates = [
+                    (today + timedelta(days=i)).strftime('%Y-%m-%d')
+                    for i in range(1, dias_previsao + 1)
+                ]
+
+                results = {
+                    'ticker': ticker,
+                    'predictions': [float(p) for p in predictions], # Ensure serializable
+                    'dates': future_dates,
+                    'metrics': metrics.to_dict(), # Convert ModelMetrics to dict
+                    'current_price': float(actual_last_price), # Ensure serializable
+                    'data_shape': self.df.shape
+                }
+
+                return results
+
+            except Exception as e:
+                logger.error(f"Erro fatal na previsão: {str(e)}", exc_info=True)
+                raise
+
+        def _predict_future_prices(self, dias_previsao: int, lookback: int) -> Tuple[List[float], float]:
+            if not LSTM_AVAILABLE:
+                raise RuntimeError("TensorFlow/Keras não está disponível. Não é possível fazer previsões futuras com o modelo LSTM.")
+            if self.df is None or self.model is None or not self.model.is_trained:
+                raise ValueError("DataFrame ou modelo não estão prontos para previsão futura.")
+
+            if len(self.df) < lookback:
+                raise ValueError(f"Dados insuficientes para previsão futura. Necessário pelo menos {lookback} dias, mas tem {len(self.df)}.")
+
+            missing_features_for_predict = [f for f in self.config.FEATURES_LSTM if f not in self.df.columns]
+            if missing_features_for_predict:
+                raise ValueError(f"Features faltando para previsão: {missing_features_for_predict}")
+
+            last_data_point_scaled = self.model.scaler.transform(self.df[self.config.FEATURES_LSTM].tail(lookback).values)
+
+            actual_last_price = self.df['Close'].iloc[-1]
+
+            predictions = []
+            current_batch = last_data_point_scaled
+
+            for i in range(dias_previsao):
+                predicted_scaled_price = self.model.predict(current_batch[np.newaxis, :, :])[0, 0]
+
+                dummy_row_for_inverse = np.zeros((1, len(self.config.FEATURES_LSTM)))
+                close_idx = self.config.FEATURES_LSTM.index("Close")
+                dummy_row_for_inverse[0, close_idx] = predicted_scaled_price
+
+                predicted_price = self.model.scaler.inverse_transform(dummy_row_for_inverse)[0, close_idx]
+
+                predictions.append(predicted_price)
+
+                next_day_features_scaled = current_batch[-1].copy()
+                next_day_features_scaled[close_idx] = predicted_scaled_price
+
+                current_batch = np.vstack([current_batch[1:], next_day_features_scaled[np.newaxis, :]])
+
+            return predictions, actual_last_price
+
+
+    class Visualizer:
+        def __init__(self, config: Config):
+            self.config = config
+
+        def plot_predictions(self, df: pd.DataFrame, predictions: List[float],
+                             future_dates: List[str], ticker: str,
+                             save_path: Optional[str] = None) -> None:
+            pass
+
+        @staticmethod
+        def plot_training_history(history: Dict[str, List[float]]) -> None:
+            pass
+
+
+    # --- Funções da análise de Bias-Variância ---
+
+    def compute_target(df: pd.DataFrame) -> pd.Series:
+        return df['Close'].pct_change(periods=5).shift(-5)
+
+    def walk_forward_with_pca_vif(data, model, window_size, step_size, n_components):
         predictions = []
-        current_batch = last_data_point_scaled
+        prediction_indices = []
+        last_scaler = None
+        last_pca = None
+        last_vif_scores = None
+        last_trained_model = None
+        last_selected_pc_indices = None
 
-        for i in range(dias_previsao):
-            predicted_scaled_price = self.model.predict(current_batch[np.newaxis, :, :])[0, 0]
+        for i in range(window_size, len(data) - 5, step_size):
+            train_data = data.iloc[i - window_size:i]
+            test_row = data.iloc[i]
 
-            dummy_row_for_inverse = np.zeros((1, len(self.config.FEATURES_LSTM)))
-            close_idx = self.config.FEATURES_LSTM.index("Close")
-            dummy_row_for_inverse[0, close_idx] = predicted_scaled_price
+            X_raw_train = train_data.drop(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Target'], errors='ignore')
+            y_train = train_data['Target']
 
-            predicted_price = self.model.scaler.inverse_transform(dummy_row_for_inverse)[0, close_idx]
+            if X_raw_train.empty or y_train.empty:
+                continue
 
-            predictions.append(predicted_price)
+            scaler = StandardScaler()
+            X_scaled_train = scaler.fit_transform(X_raw_train)
 
-            next_day_features_scaled = current_batch[-1].copy()
-            next_day_features_scaled[close_idx] = predicted_scaled_price
+            pca = PCA(n_components=n_components)
+            X_pca_train = pca.fit_transform(X_scaled_train)
 
-            current_batch = np.vstack([current_batch[1:], next_day_features_scaled[np.newaxis, :]])
+            vif_data_train = pd.DataFrame(X_pca_train, columns=[f'PC{j+1}' for j in range(n_components)])
+            if vif_data_train.shape[1] > 1:
+                vif_scores = [variance_inflation_factor(vif_data_train.values, j) for j in range(vif_data_train.shape[1])]
+                selected_pc_indices = np.array(vif_scores) < 3
+                selected_pcs_train = vif_data_train.iloc[:, selected_pc_indices]
+            else:
+                selected_pc_indices = np.array([True] * vif_data_train.shape[1])
+                selected_pcs_train = vif_data_train
 
-        return predictions, actual_last_price
+            test_raw = test_row.drop(labels=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Target'], errors='ignore').values.reshape(1, -1)
+            test_scaled = scaler.transform(test_raw)
+            test_pca = pca.transform(test_scaled)
+
+            test_vif_df = pd.DataFrame(test_pca, columns=[f'PC{j+1}' for j in range(n_components)])
+            test_selected = test_vif_df.iloc[:, selected_pc_indices]
+
+            if selected_pcs_train.empty or test_selected.empty:
+                continue
+
+            model_clone = clone(model)
+            model_clone.fit(selected_pcs_train, y_train)
+            prediction = model_clone.predict(test_selected)[0]
+            predictions.append(prediction)
+            prediction_indices.append(i)
+
+            last_scaler = scaler
+            last_pca = pca
+            last_vif_scores = vif_scores if 'vif_scores' in locals() else None
+            last_trained_model = model_clone
+            last_selected_pc_indices = selected_pc_indices
+
+        pred_series = pd.Series(data=np.nan, index=data.index)
+        if prediction_indices:
+            pred_series.iloc[prediction_indices] = predictions
+
+        return pred_series, last_scaler, last_pca, last_vif_scores, last_trained_model, last_selected_pc_indices
 
 
-class Visualizer:
-    def __init__(self, config: Config):
-        self.config = config
+    def backtest_strategy(final_data, initial_capital, capital_deployed):
+        trade_log = []
+        for i in range(len(final_data) - 5):
+            prediction = final_data.iloc[i]['Predictions']
+            if pd.isna(prediction) or prediction == 0:
+                continue
 
-    def plot_predictions(self, df: pd.DataFrame, predictions: List[float],
-                         future_dates: List[str], ticker: str,
-                         save_path: Optional[str] = None) -> None:
-        pass
+            direction = 'Long' if prediction > 0 else 'Short'
+            entry_price = final_data.iloc[i + 1]['Open']
+            exit_price = final_data.iloc[i + 5]['Close']
 
-    @staticmethod
-    def plot_training_history(history: Dict[str, List[float]]) -> None:
-        pass
+            if direction == 'Long':
+                trade_return = (exit_price - entry_price) / entry_price
+            else:
+                trade_return = (entry_price - exit_price) / entry_price
 
+            capital_change = capital_deployed * initial_capital * trade_return
 
-# --- Funções da análise de Bias-Variance ---
+            trade_log.append({
+                'Signal_Day': final_data.iloc[i]['Date'].strftime('%Y-%m-%d'),
+                'Entry_Day': final_data.iloc[i + 1]['Date'].strftime('%Y-%m-%d'),
+                'Exit_Day': final_data.iloc[i + 5]['Date'].strftime('%Y-%m-%d'),
+                'Direction': direction,
+                'Entry_Price': float(entry_price),
+                'Exit_Price': float(exit_price),
+                'Return': float(trade_return),
+                'Capital_Change': float(capital_change)
+            })
+        return pd.DataFrame(trade_log)
 
-def compute_target(df: pd.DataFrame) -> pd.Series:
-    return df['Close'].pct_change(periods=5).shift(-5)
+    def sharpe_ratio(equity_curve, risk_free_rate=0.0):
+        daily_returns = equity_curve.pct_change().dropna()
+        if daily_returns.std() == 0:
+            return 0.0
+        excess_returns = daily_returns - (risk_free_rate / 252)
+        return np.sqrt(252) * excess_returns.mean() / excess_returns.std()
 
-def walk_forward_with_pca_vif(data, model, window_size, step_size, n_components):
-    predictions = []
-    prediction_indices = []
-    last_scaler = None
-    last_pca = None
-    last_vif_scores = None
-    last_trained_model = None
-    last_selected_pc_indices = None
+    def max_drawdown(equity_curve):
+        peak = equity_curve.cummax()
+        drawdown = (equity_curve - peak) / peak
+        return drawdown.min(), drawdown
 
-    for i in range(window_size, len(data) - 5, step_size):
-        train_data = data.iloc[i - window_size:i]
-        test_row = data.iloc[i]
+    def get_models():
+        return {
+            'LinearRegression': LinearRegression(),
+            'Ridge': Ridge(),
+            'DecisionTree': DecisionTreeRegressor(),
+            'Bagging': BaggingRegressor(n_estimators=10, random_state=42), # Reduzido
+            'RandomForest': RandomForestRegressor(n_estimators=10, random_state=42), # Reduzido
+            'GradientBoosting': GradientBoostingRegressor(n_estimators=10, random_state=42) # Reduzido
+        }
 
-        X_raw_train = train_data.drop(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Target'], errors='ignore')
-        y_train = train_data['Target']
+    def evaluate_bias_variance_all(models, X, y, test_size=0.2, num_rounds=100):
+        split = int(len(X) * (1 - test_size))
+        X_train, X_test = X[:split], X[split:]
+        y_train, y_test = y[:split], y[split:]
 
-        if X_raw_train.empty or y_train.empty:
-            continue
+        results = {}
+        for name, model in models.items():
+            if len(y_train) == 0 or len(y_test) == 0:
+                results[name] = {'Total Error': np.nan, 'Bias': np.nan, 'Variance': np.nan, 'Irreducible Error': np.nan}
+                continue
 
-        scaler = StandardScaler()
-        X_scaled_train = scaler.fit_transform(X_raw_train)
+            try:
+                avg_loss, bias, var = bias_variance_decomp(
+                    model,
+                    X_train.values, y_train.values,
+                    X_test.values, y_test.values,
+                    loss='mse',
+                    num_rounds=num_rounds,
+                    random_seed=42
+                )
+                results[name] = {
+                    'Total Error': float(avg_loss),
+                    'Bias': float(bias),
+                    'Variance': float(var),
+                    'Irreducible Error': float(avg_loss - bias - var)
+                }
+            except Exception as e:
+                results[name] = {'Total Error': np.nan, 'Bias': np.nan, 'Variance': np.nan, 'Irreducible Error': np.nan}
+        return pd.DataFrame(results).T
 
-        pca = PCA(n_components=n_components)
-        X_pca_train = pca.fit_transform(X_scaled_train)
+    def find_integration_order(series):
+        d = 0
+        current_series = series.copy()
+        while True:
+            if len(current_series.dropna()) < 20:
+                return d
+            result = adfuller(current_series.dropna(), autolag='AIC')
+            if result[1] <= 0.05:
+                return d
+            current_series = current_series.diff().dropna()
+            d += 1
+            if d >= 2:
+                return d
 
-        vif_data_train = pd.DataFrame(X_pca_train, columns=[f'PC{j+1}' for j in range(n_components)])
-        if vif_data_train.shape[1] > 1:
-            vif_scores = [variance_inflation_factor(vif_data_train.values, j) for j in range(vif_data_train.shape[1])]
-            selected_pc_indices = np.array(vif_scores) < 3
-            selected_pcs_train = vif_data_train.iloc[:, selected_pc_indices]
+    # --- Tarefa Celery para a lógica de análise principal ---
+    @celery_app.task(bind=True)
+    def run_stock_analysis_task(self, ticker_input: str, period_input: str, model_choice: str = 'all'):
+        app_config = app_config_instance # Usar a instância global da configuração
+
+        app_config.TICKER = ticker_input
+        app_config.PERIOD = period_input
+
+        today = datetime.now()
+        if period_input.endswith('y'):
+            years = int(period_input[:-1])
+            start_date_offset = years * 365
+        elif period_input.endswith('mo'):
+            months = int(period_input[:-2])
+            start_date_offset = months * 30
         else:
-            selected_pc_indices = np.array([True] * vif_data_train.shape[1])
-            selected_pcs_train = vif_data_train
+            start_date_offset = app_config.START_DATE_OFFSET_YEARS * 365
 
-        test_raw = test_row.drop(labels=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Target'], errors='ignore').values.reshape(1, -1)
-        test_scaled = scaler.transform(test_raw)
-        test_pca = pca.transform(test_scaled)
+        app_config.START_DATE_OFFSET_YEARS = start_date_offset / 365
 
-        test_vif_df = pd.DataFrame(test_pca, columns=[f'PC{j+1}' for j in range(n_components)])
-        test_selected = test_vif_df.iloc[:, selected_pc_indices]
+        data_manager = DataManager(app_config)
+        end_date = today.strftime('%Y-%m-%d')
+        start_date = (today - timedelta(days=start_date_offset)).strftime('%Y-%m-%d')
 
-        if selected_pcs_train.empty or test_selected.empty:
-            continue
-
-        model_clone = clone(model)
-        model_clone.fit(selected_pcs_train, y_train)
-        prediction = model_clone.predict(test_selected)[0]
-        predictions.append(prediction)
-        prediction_indices.append(i)
-
-        last_scaler = scaler
-        last_pca = pca
-        last_vif_scores = vif_scores if 'vif_scores' in locals() else None
-        last_trained_model = model_clone
-        last_selected_pc_indices = selected_pc_indices
-
-    pred_series = pd.Series(data=np.nan, index=data.index)
-    if prediction_indices:
-        pred_series.iloc[prediction_indices] = predictions
-
-    return pred_series, last_scaler, last_pca, last_vif_scores, last_trained_model, last_selected_pc_indices
-
-
-def backtest_strategy(final_data, initial_capital, capital_deployed):
-    trade_log = []
-    for i in range(len(final_data) - 5):
-        prediction = final_data.iloc[i]['Predictions']
-        if pd.isna(prediction) or prediction == 0:
-            continue
-
-        direction = 'Long' if prediction > 0 else 'Short'
-        entry_price = final_data.iloc[i + 1]['Open']
-        exit_price = final_data.iloc[i + 5]['Close']
-
-        if direction == 'Long':
-            trade_return = (exit_price - entry_price) / entry_price
-        else:
-            trade_return = (entry_price - exit_price) / entry_price
-
-        capital_change = capital_deployed * initial_capital * trade_return
-
-        trade_log.append({
-            'Signal_Day': final_data.iloc[i]['Date'].strftime('%Y-%m-%d'),
-            'Entry_Day': final_data.iloc[i + 1]['Date'].strftime('%Y-%m-%d'),
-            'Exit_Day': final_data.iloc[i + 5]['Date'].strftime('%Y-%m-%d'),
-            'Direction': direction,
-            'Entry_Price': float(entry_price),
-            'Exit_Price': float(exit_price),
-            'Return': float(trade_return),
-            'Capital_Change': float(capital_change)
-        })
-    return pd.DataFrame(trade_log)
-
-def sharpe_ratio(equity_curve, risk_free_rate=0.0):
-    daily_returns = equity_curve.pct_change().dropna()
-    if daily_returns.std() == 0:
-        return 0.0
-    excess_returns = daily_returns - (risk_free_rate / 252)
-    return np.sqrt(252) * excess_returns.mean() / excess_returns.std()
-
-def max_drawdown(equity_curve):
-    peak = equity_curve.cummax()
-    drawdown = (equity_curve - peak) / peak
-    return drawdown.min(), drawdown
-
-def get_models():
-    return {
-        'LinearRegression': LinearRegression(),
-        'Ridge': Ridge(),
-        'DecisionTree': DecisionTreeRegressor(),
-        'Bagging': BaggingRegressor(n_estimators=100, random_state=42),
-        'RandomForest': RandomForestRegressor(n_estimators=100, random_state=42),
-        'GradientBoosting': GradientBoostingRegressor(n_estimators=100, random_state=42)
-    }
-
-def evaluate_bias_variance_all(models, X, y, test_size=0.2, num_rounds=100):
-    split = int(len(X) * (1 - test_size))
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
-
-    results = {}
-    for name, model in models.items():
-        if len(y_train) == 0 or len(y_test) == 0:
-            results[name] = {'Total Error': np.nan, 'Bias': np.nan, 'Variance': np.nan, 'Irreducible Error': np.nan}
-            continue
+        full_results = {
+            'lstm_results': None,
+            'bias_variance_results': None
+        }
 
         try:
-            avg_loss, bias, var = bias_variance_decomp(
-                model,
-                X_train.values, y_train.values,
-                X_test.values, y_test.values,
-                loss='mse',
-                num_rounds=num_rounds,
-                random_seed=42
-            )
-            results[name] = {
-                'Total Error': float(avg_loss),
-                'Bias': float(bias),
-                'Variance': float(var),
-                'Irreducible Error': float(avg_loss - bias - var)
-            }
+            self.update_state(state='PROGRESS', meta={'status': 'Baixando dados da ação...', 'progress': 10})
+            raw_df = data_manager.download_stock_data(app_config.TICKER, start_date, end_date, use_cache=True)
+            
+            if raw_df.empty:
+                raise ValueError(f"Não foi possível baixar dados para {app_config.TICKER} no período {app_config.PERIOD}. DataFrame vazio.")
+
+            self.update_state(state='PROGRESS', meta={'status': 'Calculando indicadores técnicos...', 'progress': 30})
+            processed_df = data_manager.calculate_technical_indicators(raw_df.copy())
+            
+            if processed_df.empty:
+                raise ValueError(f"DataFrame vazio após o cálculo de indicadores para {app_config.TICKER}.")
+
+            processed_df['Date'] = processed_df.index
+            processed_df.reset_index(drop=True, inplace=True)
+
+            all_indicator_columns_for_validation = [col for col in processed_df.columns if col not in ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+            data_manager.validate_data(processed_df, all_indicator_columns_for_validation)
+            data_manager.validate_data(processed_df, app_config.FEATURES_LSTM)
+
+            if model_choice == 'lstm' or model_choice == 'all':
+                self.update_state(state='PROGRESS', meta={'status': 'Executando previsão LSTM...', 'progress': 60})
+                lstm_output = run_lstm_prediction(processed_df.copy(), app_config)
+                full_results['lstm_results'] = lstm_output
+            else:
+                full_results['lstm_results'] = {"message": "Previsão LSTM não solicitada."}
+            
+            if model_choice == 'bias_variance' or model_choice == 'all':
+                self.update_state(state='PROGRESS', meta={'status': 'Executando análise Bias-Variância...', 'progress': 90})
+                bias_variance_output = run_bias_variance_analysis(processed_df.copy(), app_config)
+                full_results['bias_variance_results'] = bias_variance_output
+            else:
+                full_results['bias_variance_results'] = {"message": "Análise Bias-Variância não solicitada."}
+
+
+            return full_results # Celery serializa isso automaticamente
+
         except Exception as e:
-            results[name] = {'Total Error': np.nan, 'Bias': np.nan, 'Variance': np.nan, 'Irreducible Error': np.nan}
-    return pd.DataFrame(results).T
+            error_message = f"Erro ao preparar os dados ou executar a análise: {str(e)}\n{traceback.format_exc()}"
+            logger.error(error_message, exc_info=True)
+            # Celery armazena informações de falha automaticamente
+            raise self.retry(exc=e, countdown=5, max_retries=3) # Tentar novamente em caso de falha temporária
 
-def find_integration_order(series):
-    d = 0
-    current_series = series.copy()
-    while True:
-        if len(current_series.dropna()) < 20:
-            return d
-        result = adfuller(current_series.dropna(), autolag='AIC')
-        if result[1] <= 0.05:
-            return d
-        current_series = current_series.diff().dropna()
-        d += 1
-        if d >= 2:
-            return d
+    def run_bias_variance_analysis(df: pd.DataFrame, config: Config):
+        results_bv = {}
 
-# --- Tarefa Celery para a lógica de análise principal ---
-@celery_app.task(bind=True)
-def run_stock_analysis_task(self, ticker_input: str, period_input: str):
-    app_config = app_config_instance # Usar a instância global da configuração
+        data_for_bv = df.copy()
+        data_for_bv['Target'] = compute_target(data_for_bv)
+        data_for_bv.dropna(inplace=True)
 
-    app_config.TICKER = ticker_input
-    app_config.PERIOD = period_input
+        all_indicator_columns = [col for col in data_for_bv.columns if col not in ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Target']]
+        X_bv = data_for_bv[all_indicator_columns]
+        y_bv = data_for_bv['Target']
 
-    today = datetime.now()
-    if period_input.endswith('y'):
-        years = int(period_input[:-1])
-        start_date_offset = years * 365
-    elif period_input.endswith('mo'):
-        months = int(period_input[:-2])
-        start_date_offset = months * 30
-    else:
-        start_date_offset = app_config.START_DATE_OFFSET_YEARS * 365
+        X_bv = X_bv.dropna()
+        y_bv = y_bv.loc[X_bv.index]
 
-    app_config.START_DATE_OFFSET_YEARS = start_date_offset / 365
+        models = get_models()
+        if not X_bv.empty and not y_bv.empty:
+            bv_results = evaluate_bias_variance_all(models, X_bv, y_bv, num_rounds=config.NUM_ROUNDS_BIAS_VARIANCE)
+            results_bv['bias_variance_decomposition'] = bv_results.to_dict('index')
+        else:
+            results_bv['bias_variance_decomposition'] = "Dados insuficientes para a decomposição Bias-Variância (sem estacionarização)."
 
-    data_manager = DataManager(app_config)
-    end_date = today.strftime('%Y-%m-%d')
-    start_date = (today - timedelta(days=start_date_offset)).strftime('%Y-%m-%d')
+        integration_orders = {}
+        for col in all_indicator_columns:
+            if col in df.columns:
+                integration_orders[col] = find_integration_order(df[col].copy())
 
-    full_results = {}
+        integration_orders_df = pd.DataFrame.from_dict(integration_orders, orient='index', columns=['Integration Order'])
+        integration_orders_df.index.name = 'Indicator'
+        results_bv['integration_orders'] = integration_orders_df.to_dict('index')
 
-    try:
-        # Atualizar o estado da tarefa
-        self.update_state(state='PROGRESS', meta={'status': 'Baixando dados da ação...', 'progress': 10})
-        raw_df = data_manager.download_stock_data(app_config.TICKER, start_date, end_date, use_cache=True)
-        
-        if raw_df.empty:
-            raise ValueError(f"Não foi possível baixar dados para {app_config.TICKER} no período {app_config.PERIOD}. DataFrame vazio.")
+        differenced_indicators = df[all_indicator_columns].copy()
+        for indicator in integration_orders_df.index:
+            order = integration_orders_df.loc[indicator, 'Integration Order']
+            if order > 0:
+                differenced_indicators[indicator] = differenced_indicators[indicator].diff(order)
 
-        self.update_state(state='PROGRESS', meta={'status': 'Calculando indicadores técnicos...', 'progress': 30})
-        processed_df = data_manager.calculate_technical_indicators(raw_df.copy())
-        
-        if processed_df.empty:
-            raise ValueError(f"DataFrame vazio após o cálculo de indicadores para {app_config.TICKER}.")
+        differenced_indicators.dropna(inplace=True)
 
-        processed_df['Date'] = processed_df.index
-        processed_df.reset_index(drop=True, inplace=True)
+        data_merged_differenced = df.iloc[-len(differenced_indicators):].reset_index(drop=True)
+        data_merged_differenced = pd.concat([data_merged_differenced, differenced_indicators.reset_index(drop=True)], axis=1)
+        data_merged_differenced['Target'] = compute_target(data_merged_differenced)
+        data_merged_differenced.dropna(inplace=True)
 
-        all_indicator_columns_for_validation = [col for col in processed_df.columns if col not in ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-        data_manager.validate_data(processed_df, all_indicator_columns_for_validation)
-        data_manager.validate_data(processed_df, app_config.FEATURES_LSTM)
+        model_bv = GradientBoostingRegressor(n_estimators=10, random_state=42) # Reduzido
+        pred_series_differenced, last_scaler, last_pca, last_vif_scores, last_trained_model, last_selected_pc_indices = \
+            walk_forward_with_pca_vif(
+                data_merged_differenced, model_bv,
+                window_size=config.WINDOW_SIZE_BIAS_VARIANCE,
+                step_size=config.STEP_SIZE_BIAS_VARIANCE,
+                n_components=config.N_COMPONENTS_PCA
+            )
 
-        self.update_state(state='PROGRESS', meta={'status': 'Executando previsão LSTM...', 'progress': 60})
-        lstm_output = run_lstm_prediction(processed_df.copy(), app_config)
-        
-        self.update_state(state='PROGRESS', meta={'status': 'Executando análise Bias-Variância...', 'progress': 90})
-        bias_variance_output = run_bias_variance_analysis(processed_df.copy(), app_config)
+        data_merged_differenced['Predictions'] = pred_series_differenced
+        data_merged_differenced.dropna(subset=['Predictions'], inplace=True)
 
-        full_results['lstm_results'] = lstm_output
-        full_results['bias_variance_results'] = bias_variance_output
-
-        return full_results # Celery serializa isso automaticamente
-
-    except Exception as e:
-        error_message = f"Erro ao preparar os dados ou executar a análise: {str(e)}\n{traceback.format_exc()}"
-        logger.error(error_message, exc_info=True)
-        # Celery armazena informações de falha automaticamente
-        raise self.retry(exc=e, countdown=5, max_retries=3) # Tentar novamente em caso de falha temporária
-
-def run_bias_variance_analysis(df: pd.DataFrame, config: Config):
-    results_bv = {}
-
-    data_for_bv = df.copy()
-    data_for_bv['Target'] = compute_target(data_for_bv)
-    data_for_bv.dropna(inplace=True)
-
-    all_indicator_columns = [col for col in data_for_bv.columns if col not in ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Target']]
-    X_bv = data_for_bv[all_indicator_columns]
-    y_bv = data_for_bv['Target']
-
-    X_bv = X_bv.dropna()
-    y_bv = y_bv.loc[X_bv.index]
-
-    models = get_models()
-    if not X_bv.empty and not y_bv.empty:
-        bv_results = evaluate_bias_variance_all(models, X_bv, y_bv, num_rounds=config.NUM_ROUNDS_BIAS_VARIANCE)
-        results_bv['bias_variance_decomposition'] = bv_results.to_dict('index')
-    else:
-        results_bv['bias_variance_decomposition'] = "Dados insuficientes para a decomposição Bias-Variância (sem estacionarização)."
-
-    integration_orders = {}
-    for col in all_indicator_columns:
-        if col in df.columns:
-            integration_orders[col] = find_integration_order(df[col].copy())
-
-    integration_orders_df = pd.DataFrame.from_dict(integration_orders, orient='index', columns=['Integration Order'])
-    integration_orders_df.index.name = 'Indicator'
-    results_bv['integration_orders'] = integration_orders_df.to_dict('index')
-
-    differenced_indicators = df[all_indicator_columns].copy()
-    for indicator in integration_orders_df.index:
-        order = integration_orders_df.loc[indicator, 'Integration Order']
-        if order > 0:
-            differenced_indicators[indicator] = differenced_indicators[indicator].diff(order)
-
-    differenced_indicators.dropna(inplace=True)
-
-    data_merged_differenced = df.iloc[-len(differenced_indicators):].reset_index(drop=True)
-    data_merged_differenced = pd.concat([data_merged_differenced, differenced_indicators.reset_index(drop=True)], axis=1)
-    data_merged_differenced['Target'] = compute_target(data_merged_differenced)
-    data_merged_differenced.dropna(inplace=True)
-
-    model_bv = GradientBoostingRegressor(n_estimators=100, random_state=42)
-    pred_series_differenced, last_scaler, last_pca, last_vif_scores, last_trained_model, last_selected_pc_indices = \
-        walk_forward_with_pca_vif(
-            data_merged_differenced, model_bv,
-            window_size=config.WINDOW_SIZE_BIAS_VARIANCE,
-            step_size=config.STEP_SIZE_BIAS_VARIANCE,
-            n_components=config.N_COMPONENTS_PCA
+        final_data_differenced = data_merged_differenced[['Date', 'Open', 'Close', 'Target', 'Predictions']].copy()
+        final_data_differenced['Date'] = pd.to_datetime(final_data_differenced['Date'])
+        trades_df_differenced = backtest_strategy(
+            final_data_differenced,
+            initial_capital=config.INITIAL_CAPITAL_BACKTEST,
+            capital_deployed=config.CAPITAL_DEPLOYED_PER_TRADE
         )
+        results_bv['trade_log'] = trades_df_differenced.to_dict('records')
 
-    data_merged_differenced['Predictions'] = pred_series_differenced
-    data_merged_differenced.dropna(subset=['Predictions'], inplace=True)
+        initial_capital = config.INITIAL_CAPITAL_BACKTEST
+        if not trades_df_differenced.empty:
+            trades_df_differenced['Cumulative_Capital_Strategy'] = initial_capital + trades_df_differenced['Capital_Change'].cumsum()
+            results_bv['cumulative_capital_strategy'] = trades_df_differenced[['Exit_Day', 'Cumulative_Capital_Strategy']].to_dict('records')
 
-    final_data_differenced = data_merged_differenced[['Date', 'Open', 'Close', 'Target', 'Predictions']].copy()
-    final_data_differenced['Date'] = pd.to_datetime(final_data_differenced['Date'])
-    trades_df_differenced = backtest_strategy(
-        final_data_differenced,
-        initial_capital=config.INITIAL_CAPITAL_BACKTEST,
-        capital_deployed=config.CAPITAL_DEPLOYED_PER_TRADE
-    )
-    results_bv['trade_log'] = trades_df_differenced.to_dict('records')
+        first_trade_date = trades_df_differenced['Entry_Day'].min() if not trades_df_differenced.empty else None
+        last_trade_date = trades_df_differenced['Exit_Day'].max() if not trades_df_differenced.empty else None
 
-    initial_capital = config.INITIAL_CAPITAL_BACKTEST
-    if not trades_df_differenced.empty:
-        trades_df_differenced['Cumulative_Capital_Strategy'] = initial_capital + trades_df_differenced['Capital_Change'].cumsum()
-        results_bv['cumulative_capital_strategy'] = trades_df_differenced[['Exit_Day', 'Cumulative_Capital_Strategy']].to_dict('records')
+        bh_data = pd.DataFrame()
+        if first_trade_date and last_trade_date:
+            bh_data = df[(df['Date'] >= first_trade_date) &
+                         (df['Date'] <= last_trade_date)].copy()
 
-    first_trade_date = trades_df_differenced['Entry_Day'].min() if not trades_df_differenced.empty else None
-    last_trade_date = trades_df_differenced['Exit_Day'].max() if not trades_df_differenced.empty else None
-
-    bh_data = pd.DataFrame()
-    if first_trade_date and last_trade_date:
-        bh_data = df[(df['Date'] >= first_trade_date) &
-                     (df['Date'] <= last_trade_date)].copy()
-
-    if not bh_data.empty:
-        bh_initial_price = bh_data.iloc[0]['Close']
-        bh_data['Cumulative_Capital_BH'] = initial_capital * (bh_data['Close'] / bh_initial_price)
-        results_bv['cumulative_capital_bh'] = bh_data[['Date', 'Cumulative_Capital_BH']].to_dict('records')
-    else:
-        results_bv['cumulative_capital_bh'] = "Não há dados suficientes para calcular o Buy and Hold no período dos trades."
-
-    # Métricas da Estratégia
-    if not trades_df_differenced.empty:
-        final_capital_strategy = trades_df_differenced['Cumulative_Capital_Strategy'].iloc[-1]
-        total_return_strategy = (final_capital_strategy - initial_capital) / initial_capital
-
-        trading_days = (datetime.strptime(trades_df_differenced['Exit_Day'].iloc[-1], '%Y-%m-%d') - datetime.strptime(trades_df_differenced['Entry_Day'].iloc[0], '%Y-%m-%d')).days
-        num_years = trading_days / 365.25
-        if num_years > 0:
-            cagr_strategy = ((final_capital_strategy / initial_capital) ** (1 / num_years)) - 1
+        if not bh_data.empty:
+            bh_initial_price = bh_data.iloc[0]['Close']
+            bh_data['Cumulative_Capital_BH'] = initial_capital * (bh_data['Close'] / bh_initial_price)
+            results_bv['cumulative_capital_bh'] = bh_data[['Date', 'Cumulative_Capital_BH']].to_dict('records')
         else:
-            cagr_strategy = 0
+            results_bv['cumulative_capital_bh'] = "Não há dados suficientes para calcular o Buy and Hold no período dos trades."
 
-        sharpe_strategy = sharpe_ratio(trades_df_differenced['Cumulative_Capital_Strategy'])
-        max_dd_strategy, _ = max_drawdown(trades_df_differenced['Cumulative_Capital_Strategy'])
+        # Métricas da Estratégia
+        if not trades_df_differenced.empty:
+            final_capital_strategy = trades_df_differenced['Cumulative_Capital_Strategy'].iloc[-1]
+            total_return_strategy = (final_capital_strategy - initial_capital) / initial_capital
 
-        profitable_trades = trades_df_differenced[trades_df_differenced['Return'] > 0]
-        if len(trades_df_differenced) > 0:
-            hit_ratio_strategy = len(profitable_trades) / len(trades_df_differenced)
+            trading_days = (datetime.strptime(trades_df_differenced['Exit_Day'].iloc[-1], '%Y-%m-%d') - datetime.strptime(trades_df_differenced['Entry_Day'].iloc[0], '%Y-%m-%d')).days
+            num_years = trading_days / 365.25
+            if num_years > 0:
+                cagr_strategy = ((final_capital_strategy / initial_capital) ** (1 / num_years)) - 1
+            else:
+                cagr_strategy = 0
+
+            sharpe_strategy = sharpe_ratio(trades_df_differenced['Cumulative_Capital_Strategy'])
+            max_dd_strategy, _ = max_drawdown(trades_df_differenced['Cumulative_Capital_Strategy'])
+
+            profitable_trades = trades_df_differenced[trades_df_differenced['Return'] > 0]
+            if len(trades_df_differenced) > 0:
+                hit_ratio_strategy = len(profitable_trades) / len(trades_df_differenced)
+            else:
+                hit_ratio_strategy = 0
+
+            avg_return_per_trade_strategy = trades_df_differenced['Return'].mean()
+
+            results_bv['strategy_metrics'] = {
+                "Capital Final": float(final_capital_strategy),
+                "Retorno Total": float(total_return_strategy),
+                "CAGR": float(cagr_strategy),
+                "Sharpe Ratio": float(sharpe_strategy),
+                "Max Drawdown": float(max_dd_strategy),
+                "Hit Ratio": float(hit_ratio_strategy),
+                "Retorno Médio por Trade": float(avg_return_per_trade_strategy)
+            }
         else:
-            hit_ratio_strategy = 0
+            results_bv['strategy_metrics'] = "Não há trades para a Estratégia de Trading para calcular as métricas."
 
-        avg_return_per_trade_strategy = trades_df_differenced['Return'].mean()
+        # Métricas de Buy and Hold
+        if not bh_data.empty:
+            final_capital_bh = bh_data['Cumulative_Capital_BH'].iloc[-1]
+            total_return_bh = (final_capital_bh - initial_capital) / initial_capital
 
-        results_bv['strategy_metrics'] = {
-            "Capital Final": float(final_capital_strategy),
-            "Retorno Total": float(total_return_strategy),
-            "CAGR": float(cagr_strategy),
-            "Sharpe Ratio": float(sharpe_strategy),
-            "Max Drawdown": float(max_dd_strategy),
-            "Hit Ratio": float(hit_ratio_strategy),
-            "Retorno Médio por Trade": float(avg_return_per_trade_strategy)
-        }
-    else:
-        results_bv['strategy_metrics'] = "Não há trades para a Estratégia de Trading para calcular as métricas."
+            if num_years > 0:
+                cagr_bh = ((final_capital_bh / initial_capital) ** (1 / num_years)) - 1
+            else:
+                cagr_bh = 0
 
-    # Métricas de Buy and Hold
-    if not bh_data.empty:
-        final_capital_bh = bh_data['Cumulative_Capital_BH'].iloc[-1]
-        total_return_bh = (final_capital_bh - initial_capital) / initial_capital
+            sharpe_bh = sharpe_ratio(bh_data['Cumulative_Capital_BH'])
+            max_dd_bh, _ = max_drawdown(bh_data['Cumulative_Capital_BH'])
 
-        if num_years > 0:
-            cagr_bh = ((final_capital_bh / initial_capital) ** (1 / num_years)) - 1
+            results_bv['buy_and_hold_metrics'] = {
+                "Capital Final": float(final_capital_bh),
+                "Retorno Total": float(total_return_bh),
+                "CAGR": float(cagr_bh),
+                "Sharpe Ratio": float(sharpe_bh),
+                "Max Drawdown": float(max_dd_bh)
+            }
         else:
-            cagr_bh = 0
+            results_bv['buy_and_hold_metrics'] = "Não há dados para o Buy and Hold para calcular as métricas."
 
-        sharpe_bh = sharpe_ratio(bh_data['Cumulative_Capital_BH'])
-        max_dd_bh, _ = max_drawdown(bh_data['Cumulative_Capital_BH'])
+        # Previsão Futura para Bias-Variance
+        if last_trained_model is not None and last_scaler is not None and last_pca is not None and last_selected_pc_indices is not None:
+            if len(df) >= 30:
+                temp_df_for_latest_indicators = df.iloc[-30:].copy()
+            else:
+                temp_df_for_latest_indicators = df.copy()
 
-        results_bv['buy_and_hold_metrics'] = {
-            "Capital Final": float(final_capital_bh),
-            "Retorno Total": float(total_return_bh),
-            "CAGR": float(cagr_bh),
-            "Sharpe Ratio": float(sharpe_bh),
-            "Max Drawdown": float(max_dd_bh)
-        }
-    else:
-        results_bv['buy_and_hold_metrics'] = "Não há dados para o Buy and Hold para calcular as métricas."
+            latest_indicators_full_df = DataManager(config).calculate_technical_indicators(temp_df_for_latest_indicators)
 
-    # Previsão Futura para Bias-Variance
-    if last_trained_model is not None and last_scaler is not None and last_pca is not None and last_selected_pc_indices is not None:
-        if len(df) >= 30:
-            temp_df_for_latest_indicators = df.iloc[-30:].copy()
-        else:
-            temp_df_for_latest_indicators = df.copy()
+            if not latest_indicators_full_df.empty:
+                latest_full_indicators_row = latest_indicators_full_df.iloc[-1]
 
-        latest_indicators_full_df = DataManager(config).calculate_technical_indicators(temp_df_for_latest_indicators)
+                latest_differenced_indicators_for_prediction = latest_full_indicators_row.copy()
+                for indicator_name, order in integration_orders.items():
+                    if order > 0 and indicator_name in latest_full_indicators_row.index:
+                        if indicator_name in df.columns:
+                            temp_series = df[indicator_name]
+                            for d_order in range(order):
+                                temp_series = temp_series.diff().dropna()
 
-        if not latest_indicators_full_df.empty:
-            latest_full_indicators_row = latest_indicators_full_df.iloc[-1]
-
-            latest_differenced_indicators_for_prediction = latest_full_indicators_row.copy()
-            for indicator_name, order in integration_orders.items():
-                if order > 0 and indicator_name in latest_full_indicators_row.index:
-                    if indicator_name in df.columns:
-                        temp_series = df[indicator_name]
-                        for d_order in range(order):
-                            temp_series = temp_series.diff().dropna()
-
-                        if not temp_series.empty:
-                            latest_differenced_indicators_for_prediction[indicator_name] = temp_series.iloc[-1]
+                            if not temp_series.empty:
+                                latest_differenced_indicators_for_prediction[indicator_name] = temp_series.iloc[-1]
+                            else:
+                                latest_differenced_indicators_for_prediction.drop(indicator_name, inplace=True, errors='ignore')
                         else:
                             latest_differenced_indicators_for_prediction.drop(indicator_name, inplace=True, errors='ignore')
+                    elif indicator_name in latest_full_indicators_row.index:
+                        latest_differenced_indicators_for_prediction[indicator_name] = latest_full_indicators_row[indicator_name]
                     else:
                         latest_differenced_indicators_for_prediction.drop(indicator_name, inplace=True, errors='ignore')
-                elif indicator_name in latest_full_indicators_row.index:
-                    latest_differenced_indicators_for_prediction[indicator_name] = latest_full_indicators_row[indicator_name]
-                else:
-                    latest_differenced_indicators_for_prediction.drop(indicator_name, inplace=True, errors='ignore')
 
-            X_latest_for_prediction = pd.DataFrame([latest_differenced_indicators_for_prediction]).dropna(axis=1)
+                X_latest_for_prediction = pd.DataFrame([latest_differenced_indicators_for_prediction]).dropna(axis=1)
 
-            training_feature_columns = data_merged_differenced.drop(
-                columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Target', 'Predictions'],
-                errors='ignore'
-            ).columns
+                training_feature_columns = data_merged_differenced.drop(
+                    columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Target', 'Predictions'],
+                    errors='ignore'
+                ).columns
 
-            missing_cols = set(training_feature_columns) - set(X_latest_for_prediction.columns)
-            for c in missing_cols:
-                X_latest_for_prediction[c] = 0
+                missing_cols = set(training_feature_columns) - set(X_latest_for_prediction.columns)
+                for c in missing_cols:
+                    X_latest_for_prediction[c] = 0
 
-            extra_cols = set(X_latest_for_prediction.columns) - set(training_feature_columns)
-            X_latest_for_prediction = X_latest_for_prediction.drop(columns=list(extra_cols))
+                extra_cols = set(X_latest_for_prediction.columns) - set(training_feature_columns)
+                X_latest_for_prediction = X_latest_for_prediction.drop(columns=list(extra_cols))
 
-            X_latest_for_prediction = X_latest_for_prediction[training_feature_columns]
+                X_latest_for_prediction = X_latest_for_prediction[training_feature_columns]
 
-            X_latest_raw_for_transform = X_latest_for_prediction.values.reshape(1, -1)
+                X_latest_raw_for_transform = X_latest_for_prediction.values.reshape(1, -1)
 
-            X_latest_scaled = last_scaler.transform(X_latest_raw_for_transform)
-            X_latest_pca = last_pca.transform(X_latest_scaled)
+                X_latest_scaled = last_scaler.transform(X_latest_raw_for_transform)
+                X_latest_pca = last_pca.transform(X_latest_scaled)
 
-            X_latest_selected_pcs = pd.DataFrame(X_latest_pca, columns=[f'PC{j+1}' for j in range(last_pca.n_components_)])
-            X_latest_selected_for_prediction = X_latest_selected_pcs.iloc[:, last_selected_pc_indices]
+                X_latest_selected_pcs = pd.DataFrame(X_latest_pca, columns=[f'PC{j+1}' for j in range(last_pca.n_components_)])
+                X_latest_selected_for_prediction = X_latest_selected_pcs.iloc[:, last_selected_pc_indices]
 
-            future_prediction = last_trained_model.predict(X_latest_selected_for_prediction)[0]
+                future_prediction = last_trained_model.predict(X_latest_selected_for_prediction)[0]
 
-            latest_date_available = df['Date'].iloc[-1].strftime('%Y-%m-%d')
-            results_bv['future_prediction'] = {
-                "date_available": latest_date_available,
-                "prediction_value": float(future_prediction),
-                "direction": "ALTA" if future_prediction > 0 else ("BAIXA" if future_prediction < 0 else "NEUTRO")
+                latest_date_available = df['Date'].iloc[-1].strftime('%Y-%m-%d')
+                results_bv['future_prediction'] = {
+                    "date_available": latest_date_available,
+                    "prediction_value": float(future_prediction),
+                    "direction": "ALTA" if future_prediction > 0 else ("BAIXA" if future_prediction < 0 else "NEUTRO")
+                }
+            else:
+                results_bv['future_prediction'] = "Não foi possível gerar indicadores para a previsão futura (dados insuficientes ou erro na criação)."
+        else:
+            results_bv['future_prediction'] = "Não foi possível gerar a previsão futura. Verifique se o pipeline de dados foi executado corretamente e gerou modelos/transformadores válidos."
+
+        return results_bv
+
+    def run_lstm_prediction(df: pd.DataFrame, config: Config):
+        results_lstm = {}
+        predictor = StockPredictor(config)
+
+        try:
+            predictor.df = df.copy()
+            results = predictor.predict_stock_price(
+                ticker=config.TICKER,
+                dias_previsao=config.DIAS_PREVISAO,
+                lookback=config.LOOKBACK,
+                retrain=False
+            )
+            results_lstm = results
+        except Exception as e:
+            results_lstm['error'] = f"Erro fatal na execução principal da previsão LSTM: {str(e)}"
+            logger.error(results_lstm['error'], exc_info=True)
+        return results_lstm
+
+
+    # --- Endpoint para despachar a tarefa de análise ---
+    @app.route('/analyze_stock', methods=['POST'])
+    def analyze_stock_dispatch():
+        data = request.get_json()
+        ticker = data.get('ticker')
+        period = data.get('period')
+        model_choice = data.get('model_choice', 'all') # Novo argumento
+
+        if not ticker or not period:
+            return jsonify({"error": "Ticker e período são obrigatórios."}), 400
+
+        try:
+            # Despacha a tarefa para o Celery com a escolha do modelo
+            task = run_stock_analysis_task.delay(ticker, period, model_choice)
+            return jsonify({"message": "Análise iniciada em segundo plano.", "task_id": task.id}), 202 # 202 Accepted
+        except Exception as e:
+            error_message = f"Erro ao despachar a tarefa de análise: {str(e)}\n{traceback.format_exc()}"
+            logger.error(error_message, exc_info=True)
+            return jsonify({"error": error_message}), 500
+
+    # --- Novo Endpoint para verificar o status da tarefa ---
+    @app.route('/task_status/<task_id>', methods=['GET'])
+    def get_task_status(task_id):
+        task = celery_app.AsyncResult(task_id)
+
+        if task.state == 'PENDING':
+            response = {
+                'state': task.state,
+                'status': 'Tarefa ainda não iniciada ou na fila.'
+            }
+        elif task.state == 'PROGRESS':
+            response = {
+                'state': task.state,
+                'status': task.info.get('status', 'Processando...'),
+                'progress': task.info.get('progress', 0)
+            }
+        elif task.state == 'SUCCESS':
+            response = {
+                'state': task.state,
+                'status': 'Tarefa concluída com sucesso.',
+                'result': task.result # Os resultados da análise
+            }
+        elif task.state == 'FAILURE':
+            response = {
+                'state': task.state,
+                'status': 'Tarefa falhou.',
+                'error': str(task.info) # Informações do erro
             }
         else:
-            results_bv['future_prediction'] = "Não foi possível gerar indicadores para a previsão futura (dados insuficientes ou erro na criação)."
-    else:
-        results_bv['future_prediction'] = "Não foi possível gerar a previsão futura. Verifique se o pipeline de dados foi executado corretamente e gerou modelos/transformadores válidos."
-
-    return results_bv
-
-def run_lstm_prediction(df: pd.DataFrame, config: Config):
-    results_lstm = {}
-    predictor = StockPredictor(config)
-
-    try:
-        predictor.df = df.copy()
-        results = predictor.predict_stock_price(
-            ticker=config.TICKER,
-            dias_previsao=config.DIAS_PREVISAO,
-            lookback=config.LOOKBACK,
-            retrain=False
-        )
-        results_lstm = results
-    except Exception as e:
-        results_lstm['error'] = f"Erro fatal na execução principal da previsão LSTM: {str(e)}"
-        logger.error(results_lstm['error'], exc_info=True)
-    return results_lstm
+            response = {
+                'state': task.state,
+                'status': 'Status desconhecido.'
+            }
+        return jsonify(response)
 
 
-# --- Endpoint para despachar a tarefa de análise ---
-@app.route('/analyze_stock', methods=['POST'])
-def analyze_stock_dispatch():
-    data = request.get_json()
-    ticker = data.get('ticker')
-    period = data.get('period')
-
-    if not ticker or not period:
-        return jsonify({"error": "Ticker e período são obrigatórios."}), 400
-
-    try:
-        # Despacha a tarefa para o Celery
-        task = run_stock_analysis_task.delay(ticker, period)
-        return jsonify({"message": "Análise iniciada em segundo plano.", "task_id": task.id}), 202 # 202 Accepted
-    except Exception as e:
-        error_message = f"Erro ao despachar a tarefa de análise: {str(e)}\n{traceback.format_exc()}"
-        logger.error(error_message, exc_info=True)
-        return jsonify({"error": error_message}), 500
-
-# --- Novo Endpoint para verificar o status da tarefa ---
-@app.route('/task_status/<task_id>', methods=['GET'])
-def get_task_status(task_id):
-    task = celery_app.AsyncResult(task_id)
-
-    if task.state == 'PENDING':
-        response = {
-            'state': task.state,
-            'status': 'Tarefa ainda não iniciada ou na fila.'
-        }
-    elif task.state == 'PROGRESS':
-        response = {
-            'state': task.state,
-            'status': task.info.get('status', 'Processando...'),
-            'progress': task.info.get('progress', 0)
-        }
-    elif task.state == 'SUCCESS':
-        response = {
-            'state': task.state,
-            'status': 'Tarefa concluída com sucesso.',
-            'result': task.result # Os resultados da análise
-        }
-    elif task.state == 'FAILURE':
-        response = {
-            'state': task.state,
-            'status': 'Tarefa falhou.',
-            'error': str(task.info) # Informações do erro
-        }
-    else:
-        response = {
-            'state': task.state,
-            'status': 'Status desconhecido.'
-        }
-    return jsonify(response)
-
-
-if __name__ == '__main__':
-    print("Iniciando Flask app. Para testar localmente, acesse http://127.0.0.1:5000/ com um GET request ou http://127.0.0.1:5000/analyze_stock com um POST request.")
-    print("Certifique-se de ter as dependências instaladas: pip install -r requirements.txt")
-    print("Exemplo de POST request (usando curl):")
-    print("curl -X POST -H \"Content-Type: application/json\" -d '{\"ticker\": \"b3sa3.SA\", \"period\": \"1y\"}' http://127.0.0.1:5000/analyze_stock")
-    app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
+    if __name__ == '__main__':
+        print("Iniciando Flask app. Para testar localmente, acesse http://127.0.0.1:5000/ com um GET request ou http://127.0.0.1:5000/analyze_stock com um POST request.")
+        print("Certifique-se de ter as dependências instaladas: pip install -r requirements.txt")
+        print("Exemplo de POST request (usando curl):")
+        print("curl -X POST -H \"Content-Type: application/json\" -d '{\"ticker\": \"b3sa3.SA\", \"period\": \"1y\", \"model_choice\": \"lstm\"}' http://127.0.0.1:5000/analyze_stock")
+        app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
 
