@@ -6,7 +6,7 @@ numpy
 scikit-learn
 statsmodels
 mlxtend
-tensorflow==2.10.0 # Mantenha se for usar LSTM, caso contrário, remova.
+tensorflow==2.11.0 # Mantenha se for usar LSTM, caso contrário, remova.
 ta
 gunicorn
 celery
