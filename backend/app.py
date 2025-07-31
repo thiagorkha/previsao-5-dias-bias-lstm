@@ -97,9 +97,9 @@ class Config:
     TICKER: str = "b3sa3.SA"
     PERIOD: str = "1y"
     DIAS_PREVISAO: int = 5
-    LOOKBACK: int = 60
-    EPOCHS: int = 100
-    BATCH_SIZE: int = 32
+    LOOKBACK: int = 30
+    EPOCHS: int = 50
+    BATCH_SIZE: int = 16
     START_DATE_OFFSET_YEARS: int = 5
     FEATURES_LSTM: List[str] = field(default_factory=lambda: [
         "Close", "SMA_20", "RSI", "MACD", "BollingerBands_Upper", "BollingerBands_Lower"
