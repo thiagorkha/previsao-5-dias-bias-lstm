@@ -98,9 +98,9 @@ class Config:
     PERIOD: str = "1y"
     DIAS_PREVISAO: int = 5
     LOOKBACK: int = 30
-    EPOCHS: int = 50
+    EPOCHS: int = 15
     BATCH_SIZE: int = 16
-    START_DATE_OFFSET_YEARS: int = 5
+    START_DATE_OFFSET_YEARS: int = 2
     FEATURES_LSTM: List[str] = field(default_factory=lambda: [
         "Close", "SMA_20", "RSI", "MACD", "BollingerBands_Upper", "BollingerBands_Lower"
     ])
