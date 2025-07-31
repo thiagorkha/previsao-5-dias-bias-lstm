@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 
 const App = () => {
     const [ticker, setTicker] = useState('b3sa3.SA');
@@ -7,19 +7,37 @@ const App = () => {
     const [lstmResults, setLstmResults] = useState(null);
     const [biasVarianceResults, setBiasVarianceResults] = useState(null);
     const [error, setError] = useState(null);
+    const [taskId, setTaskId] = useState(null);
+    const [taskStatus, setTaskStatus] = useState("Aguardando início da análise...");
+    const [taskProgress, setTaskProgress] = useState(0);
 
     // IMPORTANTE: Substitua este URL pelo URL do seu backend Python implantado no Render!
-    // Exemplo: 'https://seu-nome-do-backend.onrender.com/analyze_stock'
-    const backendApiUrl = 'https://previsao-5-dias-bias-lstm.onrender.com'; 
+    // Exemplo: 'https://seu-nome-do-backend.onrender.com' (sem o /analyze_stock)
+    const backendBaseUrl = 'https://SEU_URL_BASE_DO_BACKEND_AQUI'; 
+    const dispatchEndpoint = `${backendBaseUrl}/analyze_stock`;
+    const statusEndpoint = (id) => `${backendBaseUrl}/task_status/${id}`;
 
-    const runAnalysis = async () => {
+    // Ref para o intervalo de polling para que possamos limpá-lo
+    const pollingIntervalRef = useRef(null);
+
+    // Função para iniciar a análise (despachar a tarefa)
+    const startAnalysis = async () => {
         setLoading(true);
         setError(null);
         setLstmResults(null);
         setBiasVarianceResults(null);
+        setTaskId(null);
+        setTaskStatus("Iniciando análise...");
+        setTaskProgress(0);
+
+        // Limpa qualquer intervalo de polling anterior
+        if (pollingIntervalRef.current) {
+            clearInterval(pollingIntervalRef.current);
+            pollingIntervalRef.current = null;
+        }
 
         try {
-            const response = await fetch(backendApiUrl, {
+            const response = await fetch(dispatchEndpoint, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -32,21 +50,61 @@ const App = () => {
                 throw new Error(errorData.error || `Erro HTTP: ${response.status}`);
             }
 
-            const parsedResults = await response.json();
-            
-            if (parsedResults.error) {
-                setError(parsedResults.error);
-            } else {
-                setLstmResults(parsedResults.lstm_results);
-                setBiasVarianceResults(parsedResults.bias_variance_results);
-            }
+            const data = await response.json();
+            setTaskId(data.task_id);
+            setTaskStatus(data.message || "Tarefa despachada com sucesso.");
+
+            // Inicia o polling para verificar o status da tarefa
+            pollingIntervalRef.current = setInterval(() => checkTaskStatus(data.task_id), 5000); // Consulta a cada 5 segundos
 
         } catch (fetchError) {
-            setError(`Erro na comunicação com o backend: ${fetchError.message}. Certifique-se de que o backend Python está rodando e acessível.`);
-        } finally {
+            setError(`Erro ao iniciar a análise: ${fetchError.message}.`);
+            setLoading(false); // Parar o carregamento se a tarefa não puder ser despachada
+        }
+    };
+
+    // Função para verificar o status da tarefa
+    const checkTaskStatus = async (id) => {
+        if (!id) return;
+
+        try {
+            const response = await fetch(statusEndpoint(id));
+            if (!response.ok) {
+                throw new Error(`Erro ao verificar status: ${response.status}`);
+            }
+            const data = await response.json();
+
+            setTaskStatus(data.status);
+            setTaskProgress(data.progress || 0);
+
+            if (data.state === 'SUCCESS') {
+                clearInterval(pollingIntervalRef.current); // Para o polling
+                pollingIntervalRef.current = null;
+                setLstmResults(data.result.lstm_results);
+                setBiasVarianceResults(data.result.bias_variance_results);
+                setLoading(false); // Análise concluída
+            } else if (data.state === 'FAILURE') {
+                clearInterval(pollingIntervalRef.current); // Para o polling
+                pollingIntervalRef.current = null;
+                setError(`Análise falhou: ${data.error || 'Erro desconhecido.'}`);
+                setLoading(false); // Análise falhou
+            }
+        } catch (statusError) {
+            clearInterval(pollingIntervalRef.current); // Para o polling em caso de erro de comunicação
+            pollingIntervalRef.current = null;
+            setError(`Erro ao verificar status da tarefa: ${statusError.message}`);
             setLoading(false);
         }
     };
+
+    // Limpa o intervalo quando o componente é desmontado
+    useEffect(() => {
+        return () => {
+            if (pollingIntervalRef.current) {
+                clearInterval(pollingIntervalRef.current);
+            }
+        };
+    }, []);
 
     const formatPercentage = (value) => {
         if (typeof value === 'number' && !isNaN(value)) {
@@ -97,11 +155,11 @@ const App = () => {
                 </div>
 
                 <button
-                    onClick={runAnalysis}
+                    onClick={startAnalysis}
                     disabled={loading}
                     className="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
-                    {loading ? 'Executando Análise...' : 'Executar Análise Completa'}
+                    {loading ? 'Iniciando Análise...' : 'Executar Análise Completa'}
                 </button>
             </div>
 
@@ -113,12 +171,15 @@ const App = () => {
             )}
 
             {loading && (
-                <div className="flex items-center justify-center w-full max-w-4xl mb-6 text-blue-600 text-lg">
+                <div className="flex flex-col items-center justify-center w-full max-w-4xl mb-6 text-blue-600 text-lg">
                     <svg className="animate-spin -ml-1 mr-3 h-8 w-8 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                         <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
                         <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                     </svg>
-                    Processando dados e modelos... Isso pode levar alguns minutos.
+                    <p className="mt-2 text-center">
+                        {taskStatus} {taskProgress > 0 && `(${taskProgress}%)`}
+                    </p>
+                    {taskId && <p className="text-sm text-gray-500 mt-1">ID da Tarefa: {taskId}</p>}
                 </div>
             )}
 
