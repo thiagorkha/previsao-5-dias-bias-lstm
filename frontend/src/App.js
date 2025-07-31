@@ -13,7 +13,7 @@ const App = () => {
 
     // IMPORTANTE: Substitua este URL pelo URL do seu backend Python implantado no Render!
     // Exemplo: 'https://seu-nome-do-backend.onrender.com' (sem o /analyze_stock)
-    const backendBaseUrl = 'https://SEU_URL_BASE_DO_BACKEND_AQUI'; 
+    const backendBaseUrl = 'https://previsao-5-dias-bias-lstm.onrender.com'; 
     const dispatchEndpoint = `${backendBaseUrl}/analyze_stock`;
     const statusEndpoint = (id) => `${backendBaseUrl}/task_status/${id}`;
 
